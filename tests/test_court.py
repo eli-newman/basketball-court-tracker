@@ -8,15 +8,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from court import (
     COURT_LENGTH,
     COURT_WIDTH,
-    COURT_LANDMARKS,
-    FT_LINE_DIST,
-    KEY_TOP,
-    KEY_BOTTOM,
     HALF_COURT_X,
-    THREE_PT_RADIUS,
-    BASKET_OFFSET,
+    KEYPOINT_LABEL_MAP,
+    KEYPOINT_INDEX_MAP,
     court_to_minimap,
     get_court_point,
+    get_all_vertices_ft,
 )
 
 
@@ -29,60 +26,92 @@ def test_half_court():
     assert HALF_COURT_X == 47.0
 
 
-def test_free_throw_distance():
-    assert FT_LINE_DIST == 19.0
+def test_keypoint_count():
+    """Model has 33 keypoints."""
+    assert len(KEYPOINT_LABEL_MAP) == 33
+    assert len(KEYPOINT_INDEX_MAP) == 33
 
 
-def test_key_width():
-    assert KEY_BOTTOM - KEY_TOP == 16.0
+def test_all_keypoints_in_bounds():
+    for label, (x, y) in KEYPOINT_LABEL_MAP.items():
+        assert 0 <= x <= COURT_LENGTH + 0.5, f"Label {label}: x={x:.2f} out of bounds"
+        assert 0 <= y <= COURT_WIDTH + 0.5, f"Label {label}: y={y:.2f} out of bounds"
 
 
-def test_key_centered():
-    center = (KEY_TOP + KEY_BOTTOM) / 2
-    assert center == COURT_WIDTH / 2
+def test_corner_keypoints():
+    """Labels 01 and 41 should be opposite corners."""
+    tl = get_court_point("01")  # top-left (0, 0)
+    br = get_court_point("41")  # bottom-right (94, 50)
+    assert tl is not None and br is not None
+    assert abs(tl[0]) < 0.5  # near 0
+    assert abs(tl[1]) < 0.5  # near 0
+    assert abs(br[0] - COURT_LENGTH) < 0.5  # near 94
+    assert abs(br[1] - COURT_WIDTH) < 0.5   # near 50
 
 
-def test_three_point_radius():
-    assert THREE_PT_RADIUS == 23.75
+def test_half_court_center():
+    """Label 21 is half court center."""
+    pt = get_court_point("21")
+    assert pt is not None
+    assert abs(pt[0] - HALF_COURT_X) < 1.0
+    assert abs(pt[1] - COURT_WIDTH / 2) < 1.0
 
 
 def test_basket_positions():
-    left = COURT_LANDMARKS["left_basket"]
-    right = COURT_LANDMARKS["right_basket"]
-    assert left == (BASKET_OFFSET, COURT_WIDTH / 2)
-    assert right == (COURT_LENGTH - BASKET_OFFSET, COURT_WIDTH / 2)
-    # Baskets are symmetric
-    assert left[1] == right[1]
-    assert left[0] + right[0] == COURT_LENGTH
+    """Labels 09 (left basket) and 33 (right basket) should be symmetric."""
+    left = get_court_point("09")
+    right = get_court_point("33")
+    assert left is not None and right is not None
+    # Both centered on court width
+    assert abs(left[1] - COURT_WIDTH / 2) < 1.0
+    assert abs(right[1] - COURT_WIDTH / 2) < 1.0
+    # Roughly symmetric in x
+    assert abs(left[0] + right[0] - COURT_LENGTH) < 2.0
 
 
-def test_landmarks_all_in_bounds():
-    for name, (x, y) in COURT_LANDMARKS.items():
-        assert 0 <= x <= COURT_LENGTH, f"{name} x={x} out of bounds"
-        assert 0 <= y <= COURT_WIDTH, f"{name} y={y} out of bounds"
-
-
-def test_landmarks_symmetry():
-    """Left and right landmarks should be symmetric about half court."""
-    pairs = [
-        ("left_key_top_right", "right_key_top_left"),
-        ("left_key_bottom_right", "right_key_bottom_left"),
-        ("left_ft_center", "right_ft_center"),
+def test_left_right_symmetry():
+    """Left and right side keypoints should be symmetric about half court."""
+    symmetric_pairs = [
+        ("01", "34"),  # top corners
+        ("08", "41"),  # bottom corners
+        ("04", "37"),  # baseline paint top
+        ("05", "38"),  # baseline paint bottom
+        ("12", "28"),  # free throw top
+        ("14", "30"),  # free throw bottom
+        ("10", "31"),  # 3pt straight top
+        ("11", "32"),  # 3pt straight bottom
     ]
-    for left_name, right_name in pairs:
-        lx, ly = COURT_LANDMARKS[left_name]
-        rx, ry = COURT_LANDMARKS[right_name]
-        assert abs(lx + rx - COURT_LENGTH) < 0.01, f"{left_name}/{right_name} not symmetric in x"
-        assert abs(ly - ry) < 0.01, f"{left_name}/{right_name} not symmetric in y"
+    for left_label, right_label in symmetric_pairs:
+        lx, ly = get_court_point(left_label)
+        rx, ry = get_court_point(right_label)
+        assert abs(lx + rx - COURT_LENGTH) < 1.0, f"{left_label}/{right_label} not symmetric in x"
+        assert abs(ly - ry) < 1.0, f"{left_label}/{right_label} not symmetric in y"
+
+
+def test_get_court_point_by_label():
+    pt = get_court_point("01")
+    assert pt is not None
+    assert abs(pt[0]) < 0.5
+    assert abs(pt[1]) < 0.5
+
+
+def test_get_court_point_by_index():
+    pt = get_court_point(0)  # index 0 = label "01" = top-left corner
+    assert pt is not None
+    assert abs(pt[0]) < 0.5
+    assert abs(pt[1]) < 0.5
+
+
+def test_get_court_point_unknown():
+    assert get_court_point("99") is None
+    assert get_court_point(999) is None
 
 
 def test_court_to_minimap_corners():
     w, h, pad = 940, 500, 10
-    # Top-left corner
     px, py = court_to_minimap(0, 0, w, h, pad)
     assert px == pad
     assert py == pad
-    # Bottom-right corner
     px, py = court_to_minimap(COURT_LENGTH, COURT_WIDTH, w, h, pad)
     assert px == w - pad
     assert py == h - pad
@@ -97,24 +126,12 @@ def test_court_to_minimap_center():
     assert abs(py - expected_py) <= 1
 
 
-def test_get_court_point_by_name():
-    pt = get_court_point("top-left")
-    assert pt == (0.0, 0.0)
-
-
-def test_get_court_point_by_index():
-    pt = get_court_point(0)  # index 0 = court_top_left
-    assert pt == (0.0, 0.0)
-
-
-def test_get_court_point_unknown_name():
-    pt = get_court_point("nonexistent-class")
-    assert pt is None
-
-
-def test_get_court_point_unknown_index():
-    pt = get_court_point(999)
-    assert pt is None
+def test_get_all_vertices():
+    verts = get_all_vertices_ft()
+    assert len(verts) == 33
+    # First vertex should be near (0, 0)
+    assert abs(verts[0][0]) < 0.5
+    assert abs(verts[0][1]) < 0.5
 
 
 if __name__ == "__main__":
