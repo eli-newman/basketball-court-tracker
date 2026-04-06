@@ -6,7 +6,7 @@ Handles fallback caching when keypoints are insufficient.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -17,9 +17,9 @@ from court import COURT_LENGTH, COURT_WIDTH, get_court_point
 @dataclass
 class CourtKeypoint:
     """A detected court keypoint from the Roboflow model."""
-    name: str           # Roboflow class name (e.g., "top-left")
-    pixel_x: float      # x position in the frame (pixels)
-    pixel_y: float      # y position in the frame (pixels)
+    name: Union[int, str]  # Keypoint index (int) for pose models, or class name (str)
+    pixel_x: float         # x position in the frame (pixels)
+    pixel_y: float         # y position in the frame (pixels)
     confidence: float
 
 

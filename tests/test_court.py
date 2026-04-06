@@ -97,13 +97,23 @@ def test_court_to_minimap_center():
     assert abs(py - expected_py) <= 1
 
 
-def test_get_court_point_valid():
+def test_get_court_point_by_name():
     pt = get_court_point("top-left")
     assert pt == (0.0, 0.0)
 
 
-def test_get_court_point_unknown():
+def test_get_court_point_by_index():
+    pt = get_court_point(0)  # index 0 = court_top_left
+    assert pt == (0.0, 0.0)
+
+
+def test_get_court_point_unknown_name():
     pt = get_court_point("nonexistent-class")
+    assert pt is None
+
+
+def test_get_court_point_unknown_index():
+    pt = get_court_point(999)
     assert pt is None
 
 

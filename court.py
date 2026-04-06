@@ -89,18 +89,42 @@ COURT_LANDMARKS: Dict[str, Tuple[float, float]] = {
 }
 
 
-# ── Roboflow keypoint model class name → court landmark mapping ──────────────
-# This maps the class labels from the Roboflow basketball-court-detection-2
-# model to our COURT_LANDMARKS keys. Update these after inspecting actual
-# model output on test frames.
+# ── Roboflow keypoint model mapping ──────────────────────────────────────────
+# The basketball-court-detection-2 model is a YOLOv11m-pose (keypoint) model.
+# It returns ONE detection ("the court") with an ARRAY of keypoints indexed
+# by position (like body joints in pose estimation).
 #
-# The Roboflow model detects court keypoints as object detection classes.
-# Each detected "object" is a court landmark at a specific pixel location.
+# KEYPOINT_INDEX_MAP maps keypoint index → court landmark key.
+# These indices must be calibrated by running the model on test frames
+# and inspecting the response. The model typically has ~14-20 keypoints.
+#
+# Supported mapping modes:
+# 1. Index-based: pose model returns keypoints as array (primary)
+# 2. Name-based: some API formats return keypoints with class_name (fallback)
 
-ROBOFLOW_KEYPOINT_MAP: Dict[str, str] = {
-    # Format: "roboflow_class_name": "court_landmark_key"
-    # These will be calibrated by running the model on test frames.
-    # Below are best-guess mappings based on common Roboflow court models.
+KEYPOINT_INDEX_MAP: Dict[int, str] = {
+    # Format: keypoint_index: "court_landmark_key"
+    # CALIBRATE THESE by running inspect_keypoints() on a test frame.
+    # Below are best-guess indices based on typical court keypoint models.
+    # The model likely orders keypoints roughly: corners → half court → keys → 3pt
+    0: "court_top_left",
+    1: "court_top_right",
+    2: "court_bottom_left",
+    3: "court_bottom_right",
+    4: "half_court_top",
+    5: "half_court_bottom",
+    6: "left_key_top_right",      # left free throw line top
+    7: "left_key_bottom_right",   # left free throw line bottom
+    8: "right_key_top_left",      # right free throw line top
+    9: "right_key_bottom_left",   # right free throw line bottom
+    10: "left_key_top_left",      # left baseline-key intersection top
+    11: "left_key_bottom_left",   # left baseline-key intersection bottom
+    12: "right_key_top_right",    # right baseline-key intersection top
+    13: "right_key_bottom_right", # right baseline-key intersection bottom
+}
+
+# Fallback: name-based mapping for API formats that return class names
+KEYPOINT_NAME_MAP: Dict[str, str] = {
     "top-left": "court_top_left",
     "top-right": "court_top_right",
     "bottom-left": "court_bottom_left",
@@ -110,27 +134,34 @@ ROBOFLOW_KEYPOINT_MAP: Dict[str, str] = {
     "half-center": "half_court_center",
     "left-ft-top": "left_key_top_right",
     "left-ft-bottom": "left_key_bottom_right",
-    "left-ft-center": "left_ft_center",
     "right-ft-top": "right_key_top_left",
     "right-ft-bottom": "right_key_bottom_left",
-    "right-ft-center": "right_ft_center",
-    "left-key-top": "left_key_top_left",
-    "left-key-bottom": "left_key_bottom_left",
-    "right-key-top": "right_key_top_right",
-    "right-key-bottom": "right_key_bottom_right",
-    "left-three-top": "left_three_top",
-    "left-three-bottom": "left_three_bottom",
-    "right-three-top": "right_three_top",
-    "right-three-bottom": "right_three_bottom",
 }
 
 
-def get_court_point(roboflow_class: str) -> Tuple[float, float] | None:
-    """Map a Roboflow keypoint class name to real-world court coordinates.
+def get_court_point_by_index(index: int) -> Tuple[float, float] | None:
+    """Map a keypoint index to real-world court coordinates.
 
-    Returns (x_ft, y_ft) or None if the class name is not recognized.
+    Used for pose/keypoint model responses (primary mode).
+    Returns (x_ft, y_ft) or None if the index is not mapped.
     """
-    landmark_key = ROBOFLOW_KEYPOINT_MAP.get(roboflow_class)
+    landmark_key = KEYPOINT_INDEX_MAP.get(index)
+    if landmark_key is None:
+        return None
+    return COURT_LANDMARKS.get(landmark_key)
+
+
+def get_court_point(name_or_index) -> Tuple[float, float] | None:
+    """Map a Roboflow keypoint (by name or index) to court coordinates.
+
+    Accepts either a string class name or an integer index.
+    Returns (x_ft, y_ft) or None if not recognized.
+    """
+    if isinstance(name_or_index, int):
+        return get_court_point_by_index(name_or_index)
+
+    # Name-based lookup
+    landmark_key = KEYPOINT_NAME_MAP.get(name_or_index)
     if landmark_key is None:
         return None
     return COURT_LANDMARKS.get(landmark_key)

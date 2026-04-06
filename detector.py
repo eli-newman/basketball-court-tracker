@@ -78,30 +78,75 @@ class PlayerDetector:
 
 
 class CourtKeypointDetector:
-    """Roboflow API basketball court keypoint detection."""
+    """Roboflow API basketball court keypoint detection.
+
+    The basketball-court-detection-2 model is a YOLOv11m-pose model.
+    It returns ONE detection ("the court") with an ARRAY of keypoints,
+    not separate object detection classes.
+
+    The API response format for keypoint models is:
+    {
+      "predictions": [{
+        "x": ..., "y": ..., "width": ..., "height": ...,
+        "keypoints": [
+          {"x": px, "y": py, "confidence": conf, "class_name": "0"},
+          {"x": px, "y": py, "confidence": conf, "class_name": "1"},
+          ...
+        ]
+      }]
+    }
+
+    Each keypoint index maps to a court landmark via KEYPOINT_INDEX_MAP in court.py.
+    """
 
     def __init__(self, config: Config):
         self.config = config
         self.api_url = f"https://detect.roboflow.com/{config.court_model_id}"
+        self._last_raw_response: Optional[dict] = None
 
     def detect(self, frame: np.ndarray) -> List[CourtKeypoint]:
         """Detect court keypoints in a frame.
 
-        Returns list of CourtKeypoint with pixel positions and class names.
+        Handles both pose model (keypoints array) and object detection
+        (separate predictions) response formats.
         """
         try:
             result = self._call_api(frame, self.config.court_confidence)
             if result is None:
                 return []
 
+            self._last_raw_response = result
             keypoints = []
+
             for pred in result.get("predictions", []):
-                keypoints.append(CourtKeypoint(
-                    name=pred.get("class", ""),
-                    pixel_x=pred["x"],
-                    pixel_y=pred["y"],
-                    confidence=pred.get("confidence", 0.0),
-                ))
+                # Pose model format: prediction has a "keypoints" array
+                if "keypoints" in pred:
+                    for kp in pred["keypoints"]:
+                        conf = kp.get("confidence", 0.0)
+                        if conf < self.config.court_confidence:
+                            continue
+                        # class_name is the keypoint index as string (e.g., "0", "1")
+                        # or a descriptive name
+                        name = kp.get("class_name", kp.get("class", ""))
+                        try:
+                            name = int(name)  # convert "0" → 0 for index-based lookup
+                        except (ValueError, TypeError):
+                            pass  # keep as string for name-based lookup
+                        keypoints.append(CourtKeypoint(
+                            name=name,
+                            pixel_x=kp["x"],
+                            pixel_y=kp["y"],
+                            confidence=conf,
+                        ))
+                else:
+                    # Object detection format fallback: each prediction is a keypoint
+                    keypoints.append(CourtKeypoint(
+                        name=pred.get("class", ""),
+                        pixel_x=pred["x"],
+                        pixel_y=pred["y"],
+                        confidence=pred.get("confidence", 0.0),
+                    ))
+
             return keypoints
         except Exception:
             return []
@@ -125,10 +170,14 @@ class CourtKeypointDetector:
             return None
         return response.json()
 
-    def inspect_classes(self, frame: np.ndarray) -> List[str]:
-        """Run detection and return all unique class names found.
+    def inspect_keypoints(self, frame: np.ndarray) -> dict:
+        """Run detection and return raw response for calibration.
 
-        Useful for calibrating the ROBOFLOW_KEYPOINT_MAP in court.py.
+        Use this to inspect the actual keypoint indices/names and pixel
+        positions returned by the model. Essential for setting up
+        KEYPOINT_INDEX_MAP in court.py.
+
+        Returns the raw API response dict.
         """
-        keypoints = self.detect(frame)
-        return sorted(set(kp.name for kp in keypoints))
+        result = self._call_api(frame, 0.1)  # low confidence to see all keypoints
+        return result or {}
