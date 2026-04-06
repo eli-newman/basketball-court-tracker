@@ -41,6 +41,9 @@ class Config:
     minimap_padding: int = 10
     trail_length: int = 15
 
+    # Team classification
+    n_teams: int = 2  # 2 = just teams, 3 = teams + referees
+
     # Colors (BGR)
     color_team_a: tuple = (255, 100, 50)    # blue-ish
     color_team_b: tuple = (50, 50, 255)     # red-ish
@@ -64,6 +67,7 @@ class Config:
         parser.add_argument("--frame-skip", type=int, default=1)
         parser.add_argument("--max-frames", type=int, default=0)
         parser.add_argument("--smoothing", type=int, default=5, help="Temporal smoothing window")
+        parser.add_argument("--n-teams", type=int, default=2, help="Number of teams (2 or 3 for refs)")
         parser.add_argument("--debug", action="store_true", help="Draw debug overlays")
 
         args = parser.parse_args()
@@ -79,6 +83,7 @@ class Config:
             frame_skip=args.frame_skip,
             max_frames=args.max_frames,
             smoothing_window=args.smoothing,
+            n_teams=args.n_teams,
             debug=args.debug,
         )
 

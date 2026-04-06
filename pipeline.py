@@ -15,6 +15,7 @@ from config import Config
 from detector import PlayerDetector, CourtKeypointDetector
 from tracker import PlayerTracker
 from mapper import CourtMapper, MappedPlayer
+from team_classifier import TeamClassifier
 from visualizer import CompositeRenderer
 
 
@@ -32,6 +33,7 @@ class Pipeline:
         self.court_detector = CourtKeypointDetector(config)
         self.tracker = PlayerTracker(config)
         self.mapper = CourtMapper(config)
+        self.team_classifier = TeamClassifier(n_teams=config.n_teams)
 
         # Video info (set in run())
         self.video_info = None
@@ -88,18 +90,26 @@ class Pipeline:
                 # 2. Detect players
                 raw_players = self.player_detector.detect(frame)
 
-                # 3. Track players (assign persistent IDs)
+                # 3. Classify teams by jersey color
+                team_ids = self.team_classifier.classify(frame, raw_players)
+
+                # 4. Track players (assign persistent IDs)
                 tracked_players = self.tracker.update(raw_players)
 
-                # 4. Map to court coordinates
+                # 5. Map to court coordinates
                 h_valid, mapped_players = self.mapper.map_frame(
                     keypoints, tracked_players
                 )
 
+                # 6. Assign team IDs to mapped players
+                #    Match by bbox proximity since tracker may reorder
+                if team_ids and team_ids[0] != -1:
+                    self._assign_team_ids(mapped_players, raw_players, team_ids)
+
                 if h_valid:
                     valid_homography_count += 1
 
-                # 5. Render composite frame
+                # 7. Render composite frame
                 composite = self.renderer.render(
                     frame,
                     self.tracker.last_sv_detections,
@@ -108,10 +118,10 @@ class Pipeline:
                     keypoints=keypoints if self.config.debug else None,
                 )
 
-                # 6. Write frame
+                # 8. Write frame
                 sink.write_frame(composite)
 
-                # 7. Collect coordinate data
+                # 9. Collect coordinate data
                 frame_data = self._build_frame_record(
                     frame_idx=frame_count,
                     timestamp_ms=frame_count * (1000.0 / self.video_info.fps),
@@ -147,6 +157,25 @@ class Pipeline:
         print(f"Output JSON:  {json_out}")
         print(f"Output CSV:   {csv_out}")
         print("=" * 60)
+
+    @staticmethod
+    def _assign_team_ids(
+        mapped_players: List[MappedPlayer],
+        raw_players,
+        team_ids: List[int],
+    ):
+        """Match team_ids from raw detections to mapped players by bbox proximity."""
+        for mp in mapped_players:
+            best_dist = float("inf")
+            best_team = -1
+            for raw, tid in zip(raw_players, team_ids):
+                dx = mp.pixel_x - raw.center[0]
+                dy = mp.pixel_y - raw.center[1]
+                dist = dx * dx + dy * dy
+                if dist < best_dist:
+                    best_dist = dist
+                    best_team = tid
+            mp.team_id = best_team
 
     def _build_frame_record(
         self,
