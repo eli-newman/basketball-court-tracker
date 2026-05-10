@@ -1,7 +1,17 @@
-"""Detection layer: Roboflow API for players + court keypoints."""
+"""Detection layer: Roboflow models for players + court keypoints.
+
+Two backends are available:
+- "hosted" (default): POSTs each frame to detect.roboflow.com. ~0.5 fps,
+  network-bound. Useful for quick local validation without GPU setup.
+- "local": runs the same Roboflow models locally via the `inference`
+  package (CPU) or `inference-gpu` (CUDA). ~30+ fps on a Colab T4. Same
+  model_ids, same response shape — drop-in.
+
+Pick the backend via `Config.inference_backend` ("hosted" or "local").
+"""
 
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 import base64
 import time
 
@@ -14,6 +24,56 @@ from homography import CourtKeypoint
 
 
 _TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
+
+
+# ── Local inference backend (lazy) ───────────────────────────────────────────
+# Models are heavy (weights, ONNX runtime) and only needed when backend="local".
+# We cache one loaded model per model_id for the lifetime of the process.
+
+_LOCAL_MODEL_CACHE: Dict[str, Any] = {}
+
+
+def _get_local_model(model_id: str, api_key: str) -> Any:
+    """Lazy-load a Roboflow model for local inference. Cached by model_id."""
+    if model_id in _LOCAL_MODEL_CACHE:
+        return _LOCAL_MODEL_CACHE[model_id]
+    try:
+        from inference import get_model  # type: ignore
+    except ImportError as e:
+        raise RuntimeError(
+            "Local inference requires the `inference` package. "
+            "Install with `pip install inference` (CPU) or "
+            "`pip install inference-gpu` (CUDA)."
+        ) from e
+    model = get_model(model_id=model_id, api_key=api_key)
+    _LOCAL_MODEL_CACHE[model_id] = model
+    return model
+
+
+def _local_infer(model_id: str, api_key: str, frame: np.ndarray, confidence: float) -> Optional[dict]:
+    """Run a frame through a locally-loaded Roboflow model.
+
+    Returns a dict in the same shape as the hosted API
+    (``{"predictions": [...]}``) so downstream parsing is identical.
+    """
+    model = _get_local_model(model_id, api_key)
+    try:
+        responses = model.infer(frame, confidence=confidence)
+    except Exception as e:  # pragma: no cover — surface the real error
+        print(f"[detector] local infer failed for {model_id}: {type(e).__name__}: {e}")
+        return None
+    if not responses:
+        return {"predictions": []}
+    resp = responses[0]
+    # InferenceResponse → dict; hosted API key is "predictions"
+    if hasattr(resp, "dict"):
+        return resp.dict(by_alias=True, exclude_none=True)
+    if hasattr(resp, "model_dump"):
+        return resp.model_dump(by_alias=True, exclude_none=True)
+    if isinstance(resp, dict):
+        return resp
+    print(f"[detector] unexpected local infer response type: {type(resp).__name__}")
+    return None
 
 
 def _post_with_retry(
@@ -106,6 +166,13 @@ class PlayerDetector:
         return players
 
     def _call_api(self, frame: np.ndarray, confidence: float) -> Optional[dict]:
+        if self.config.inference_backend == "local":
+            return _local_infer(
+                self.config.player_model_id,
+                self.config.roboflow_api_key,
+                frame,
+                confidence,
+            )
         _, buffer = cv2.imencode(".jpg", frame)
         img_b64 = base64.b64encode(buffer).decode("utf-8")
         return _post_with_retry(
@@ -194,6 +261,13 @@ class CourtKeypointDetector:
         return keypoints
 
     def _call_api(self, frame: np.ndarray, confidence: float) -> Optional[dict]:
+        if self.config.inference_backend == "local":
+            return _local_infer(
+                self.config.court_model_id,
+                self.config.roboflow_api_key,
+                frame,
+                confidence,
+            )
         _, buffer = cv2.imencode(".jpg", frame)
         img_b64 = base64.b64encode(buffer).decode("utf-8")
         return _post_with_retry(

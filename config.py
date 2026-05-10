@@ -13,6 +13,10 @@ class Config:
 
     # Roboflow API
     roboflow_api_key: str = ""
+    # "hosted" = POST to detect.roboflow.com (works anywhere, ~0.5 fps).
+    # "local"  = run model locally via the `inference` package (needs
+    #            `inference` or `inference-gpu`; ~30 fps on a Colab T4 GPU).
+    inference_backend: str = "hosted"
 
     # Player detection
     player_model_id: str = "basketball-player-detection-3-ycjdo/6"
@@ -70,6 +74,11 @@ class Config:
         parser.add_argument("--smoothing", type=int, default=5, help="Temporal smoothing window")
         parser.add_argument("--n-teams", type=int, default=2, help="Number of teams (2 or 3 for refs)")
         parser.add_argument("--debug", action="store_true", help="Draw debug overlays")
+        parser.add_argument(
+            "--backend", choices=["hosted", "local"], default="hosted",
+            help="Inference backend: 'hosted' (Roboflow API) or 'local' "
+                 "(runs model locally via the inference package).",
+        )
 
         args = parser.parse_args()
         return cls(
@@ -86,6 +95,7 @@ class Config:
             smoothing_window=args.smoothing,
             n_teams=args.n_teams,
             debug=args.debug,
+            inference_backend=args.backend,
         )
 
     @classmethod
