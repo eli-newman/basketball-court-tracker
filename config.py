@@ -13,10 +13,15 @@ class Config:
 
     # Roboflow API
     roboflow_api_key: str = ""
-    # "hosted" = POST to detect.roboflow.com (works anywhere, ~0.5 fps).
-    # "local"  = run model locally via the `inference` package (needs
+    # "hosted" = POST to `inference_host` (default detect.roboflow.com).
+    #            Same protocol works against any Roboflow inference-server
+    #            container (e.g. friend's DGX Spark exposed over Tailscale).
+    # "local"  = run model in-process via the `inference` package (needs
     #            `inference` or `inference-gpu`; ~30 fps on a Colab T4 GPU).
     inference_backend: str = "hosted"
+    # HTTP base URL for the "hosted" backend. Override to point at a self-
+    # hosted inference server, e.g. http://spark.tailnet:9001
+    inference_host: str = "https://detect.roboflow.com"
 
     # Player detection
     player_model_id: str = "basketball-player-detection-3-ycjdo/6"
@@ -76,8 +81,14 @@ class Config:
         parser.add_argument("--debug", action="store_true", help="Draw debug overlays")
         parser.add_argument(
             "--backend", choices=["hosted", "local"], default="hosted",
-            help="Inference backend: 'hosted' (Roboflow API) or 'local' "
-                 "(runs model locally via the inference package).",
+            help="Inference backend: 'hosted' (HTTP, default) or 'local' "
+                 "(in-process via the inference package).",
+        )
+        parser.add_argument(
+            "--inference-host", default="https://detect.roboflow.com",
+            help="Base URL for the 'hosted' backend. Override to point at a "
+                 "self-hosted Roboflow inference-server (e.g. a friend's "
+                 "DGX Spark on Tailscale): http://spark.tail-xxx.ts.net:9001",
         )
 
         args = parser.parse_args()
@@ -96,6 +107,7 @@ class Config:
             n_teams=args.n_teams,
             debug=args.debug,
             inference_backend=args.backend,
+            inference_host=args.inference_host,
         )
 
     @classmethod

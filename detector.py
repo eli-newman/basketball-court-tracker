@@ -133,7 +133,7 @@ class PlayerDetector:
 
     def __init__(self, config: Config):
         self.config = config
-        self.api_url = f"https://detect.roboflow.com/{config.player_model_id}"
+        self.api_url = f"{config.inference_host.rstrip('/')}/{config.player_model_id}"
 
     def detect(self, frame: np.ndarray) -> List[PlayerDetection]:
         """Detect players in a frame.
@@ -208,7 +208,7 @@ class CourtKeypointDetector:
 
     def __init__(self, config: Config):
         self.config = config
-        self.api_url = f"https://detect.roboflow.com/{config.court_model_id}"
+        self.api_url = f"{config.inference_host.rstrip('/')}/{config.court_model_id}"
         self._last_raw_response: Optional[dict] = None
 
     def detect(self, frame: np.ndarray) -> List[CourtKeypoint]:
