@@ -107,11 +107,15 @@ class OverlayRenderer:
 
     def __init__(self, config: Config):
         self.config = config
-        self.box_annotator = sv.BoxAnnotator(thickness=2)
+        self.box_annotator = sv.BoxAnnotator(
+            thickness=2,
+            color_lookup=sv.ColorLookup.TRACK,
+        )
         self.label_annotator = sv.LabelAnnotator(
             text_position=sv.Position.TOP_CENTER,
             text_thickness=1,
             text_scale=0.5,
+            color_lookup=sv.ColorLookup.TRACK,
         )
 
     def render(

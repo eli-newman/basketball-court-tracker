@@ -17,6 +17,7 @@ class Config:
     # Player detection
     player_model_id: str = "basketball-player-detection-3-ycjdo/6"
     player_confidence: float = 0.4
+    nms_iou_threshold: float = 0.5  # de-dup overlapping boxes the model's NMS missed
 
     # Court keypoint detection
     court_model_id: str = "basketball-court-detection-2/13"

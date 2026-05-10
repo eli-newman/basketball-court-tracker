@@ -4,6 +4,7 @@ import json
 import csv
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List
 
@@ -38,6 +39,9 @@ class Pipeline:
         # Video info (set in run())
         self.video_info = None
         self.renderer = None
+
+        # Two-worker pool: player + keypoint detection run concurrently per frame
+        self._detector_pool = ThreadPoolExecutor(max_workers=2)
 
     def run(self):
         """Process the full video and generate outputs."""
@@ -84,11 +88,12 @@ class Pipeline:
                 if self.config.max_frames > 0 and processed >= self.config.max_frames:
                     break
 
-                # 1. Detect court keypoints
-                keypoints = self.court_detector.detect(frame)
-
-                # 2. Detect players
-                raw_players = self.player_detector.detect(frame)
+                # 1+2. Run court keypoint and player detection in parallel
+                # (both are I/O-bound HTTP calls to Roboflow ~1s each).
+                keypoints_fut = self._detector_pool.submit(self.court_detector.detect, frame)
+                players_fut = self._detector_pool.submit(self.player_detector.detect, frame)
+                keypoints = keypoints_fut.result()
+                raw_players = players_fut.result()
 
                 # 3. Classify teams by jersey color
                 team_ids = self.team_classifier.classify(frame, raw_players)

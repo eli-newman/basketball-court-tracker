@@ -29,15 +29,104 @@ result = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--forma
 print(f"GPU: {result.stdout.strip()}" if result.returncode == 0 else "No GPU detected (will be slower)")
 print("Dependencies installed!")
 
-#@title 2. Mount Google Drive
-from google.colab import drive
-drive.mount('/content/drive')
+#@title 2. Mount Google Drive (optional — skip if uploading directly)
+#@markdown Mount Drive if your clips live there or you want outputs persisted across sessions.
+MOUNT_DRIVE = True  #@param {type:"boolean"}
+if MOUNT_DRIVE:
+    from google.colab import drive
+    drive.mount('/content/drive')
+
+#@title 2a. Ingest: Fetch a Knicks clip from YouTube (yt-dlp)
+#@markdown Paste a YouTube URL. Optionally set a time range to grab just one possession.
+#@markdown Output goes to `/content/clips/<LABEL>.mp4`.
+YOUTUBE_URL = ""  #@param {type:"string"}
+LABEL = "knicks_clip"  #@param {type:"string"}
+START_TIME = ""  #@param {type:"string"}
+END_TIME = ""    #@param {type:"string"}
+MAX_HEIGHT = 720  #@param {type:"integer"}
+RUN_YT_INGEST = False  #@param {type:"boolean"}
+
+if RUN_YT_INGEST and YOUTUBE_URL:
+    !pip install -q -U yt-dlp
+    import os
+    os.makedirs("/content/clips", exist_ok=True)
+    out_path = f"/content/clips/{LABEL}.mp4"
+    section_arg = ""
+    if START_TIME and END_TIME:
+        section_arg = f'--download-sections "*{START_TIME}-{END_TIME}"'
+    fmt = f"bestvideo[height<={MAX_HEIGHT}][ext=mp4]+bestaudio/best[height<={MAX_HEIGHT}]"
+    !yt-dlp -f "{fmt}" --merge-output-format mp4 {section_arg} -o "{out_path}" "{YOUTUBE_URL}"
+    print(f"Saved: {out_path}")
+    INGESTED_PATH = out_path
+else:
+    print("Skipping YouTube ingest. Toggle RUN_YT_INGEST + paste a URL to use.")
+    INGESTED_PATH = None
+
+#@title 2b. Ingest: Upload a local clip from your computer
+#@markdown Use this for screen-recordings or pre-cleaned clips on your laptop.
+#@markdown Run the cell, then pick the file in the dialog that appears.
+RUN_LOCAL_UPLOAD = False  #@param {type:"boolean"}
+
+if RUN_LOCAL_UPLOAD:
+    from google.colab import files
+    import shutil, os
+    os.makedirs("/content/clips", exist_ok=True)
+    uploaded = files.upload()
+    if uploaded:
+        src_name = list(uploaded.keys())[0]
+        ext = os.path.splitext(src_name)[1] or ".mp4"
+        dst = f"/content/clips/uploaded{ext}"
+        shutil.move(src_name, dst)
+        print(f"Saved: {dst}")
+        INGESTED_PATH = dst
+else:
+    print("Skipping local upload. Toggle RUN_LOCAL_UPLOAD to upload a file.")
+
+#@title 2c. Optional: Clean an ingested clip (crop YouTube chrome, drop fps, trim)
+#@markdown Only needed for hand-recorded YouTube tabs. yt-dlp output is already clean.
+SOURCE_PATH = ""  #@param {type:"string"}
+TRIM_START_SEC = 0  #@param {type:"number"}
+CROP_BOTTOM_PX = 0  #@param {type:"integer"}
+CROP_TOP_PX = 0  #@param {type:"integer"}
+TARGET_FPS = 30  #@param {type:"integer"}
+TARGET_WIDTH = 1280  #@param {type:"integer"}
+RUN_CLEAN = False  #@param {type:"boolean"}
+
+if RUN_CLEAN and SOURCE_PATH:
+    import os, subprocess
+    os.makedirs("/content/clips", exist_ok=True)
+    out_path = "/content/clips/cleaned.mp4"
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0", SOURCE_PATH],
+        capture_output=True, text=True,
+    )
+    w, h = [int(x) for x in probe.stdout.strip().split(",")]
+    new_h = h - CROP_TOP_PX - CROP_BOTTOM_PX
+    vf = f"crop={w}:{new_h}:0:{CROP_TOP_PX},scale={TARGET_WIDTH}:-2"
+    cmd = (
+        f'ffmpeg -y -ss {TRIM_START_SEC} -i "{SOURCE_PATH}" '
+        f'-vf "{vf}" -r {TARGET_FPS} '
+        f'-c:v libx264 -preset medium -crf 23 -c:a aac -b:a 96k '
+        f'-movflags +faststart "{out_path}"'
+    )
+    !{cmd}
+    print(f"Cleaned: {out_path}")
+    INGESTED_PATH = out_path
+else:
+    print("Skipping clean step.")
 
 #@title 3. Configuration
 #@markdown ### Required Settings
+#@markdown `VIDEO_PATH` defaults to whatever cell 2a/2b/2c just produced.
+#@markdown You can override it with any path on the Colab disk or `/content/drive/...`.
 ROBOFLOW_API_KEY = ""  #@param {type:"string"}
-VIDEO_PATH = "/content/drive/MyDrive/basketball_clip.mp4"  #@param {type:"string"}
+VIDEO_PATH = ""  #@param {type:"string"}
 OUTPUT_DIR = "/content/drive/MyDrive/basketball_output"  #@param {type:"string"}
+
+if not VIDEO_PATH and "INGESTED_PATH" in globals() and INGESTED_PATH:
+    VIDEO_PATH = INGESTED_PATH
+    print(f"Using ingested path: {VIDEO_PATH}")
 
 #@markdown ### Detection Settings
 PLAYER_CONFIDENCE = 0.4  #@param {type:"slider", min:0.1, max:0.9, step:0.05}

@@ -69,10 +69,7 @@ class CourtMapper:
             if court_pos is None:
                 continue
 
-            # Extract track_id from the tracked detection
-            # ByteTrack returns detections in order, but we need the ID
-            # For now, use bbox hash as pseudo-ID (real ID comes from tracker)
-            track_id = _bbox_hash(player.bbox)
+            track_id = player.track_id
 
             # Apply temporal smoothing
             smoothed = self._smooth(track_id, court_pos)
@@ -118,8 +115,3 @@ class CourtMapper:
     @property
     def homography_valid(self) -> bool:
         return self.engine.has_valid_homography
-
-
-def _bbox_hash(bbox: tuple) -> int:
-    """Generate a simple hash from a bounding box for track matching."""
-    return hash((round(bbox[0], 1), round(bbox[1], 1), round(bbox[2], 1), round(bbox[3], 1)))
