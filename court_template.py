@@ -182,7 +182,73 @@ def _draw_basket(img, ft_to_px, ft_to_radius, line_t, side):
     cv2.circle(img, rim_center, max(rim_r, 2), RIM_COLOR, line_t)
 
 
+def generate_half_court_image(
+    side: str,
+    width: int = 470,
+    height: int = 500,
+    padding: int = 10,
+) -> np.ndarray:
+    """Generate a top-down view of one half of the court (47ft × 50ft).
+
+    The active half fills the canvas, doubling the on-screen scale of a
+    full-court minimap. The half-court line is drawn at the canvas edge
+    closest to the inactive half (right edge for side="left", left edge
+    for side="right"), with a fade so it's clear that's the boundary.
+    """
+    if side not in ("left", "right"):
+        raise ValueError(f"side must be 'left' or 'right', got {side!r}")
+
+    img = np.full((height, width, 3), COURT_COLOR, dtype=np.uint8)
+
+    from court import court_to_minimap_half
+
+    def ft_to_px(x_ft: float, y_ft: float) -> tuple[int, int]:
+        return court_to_minimap_half(x_ft, y_ft, side, width, height, padding)
+
+    def ft_to_radius(r_ft: float) -> int:
+        # Half-court x range is 47ft; the canvas width represents 47ft.
+        draw_w = width - 2 * padding
+        scale = draw_w / (COURT_LENGTH / 2)
+        return max(1, int(r_ft * scale))
+
+    line_t = max(1, width // 400)
+
+    # ── Outline of just this half ────────────────────────────────────────
+    if side == "left":
+        x_lo, x_hi = 0.0, COURT_LENGTH / 2
+    else:
+        x_lo, x_hi = COURT_LENGTH / 2, COURT_LENGTH
+
+    cv2.rectangle(img, ft_to_px(x_lo, 0), ft_to_px(x_hi, COURT_WIDTH), LINE_COLOR, line_t)
+
+    # ── Half-court line (the inner edge of this half) + center circle arc
+    cv2.line(
+        img, ft_to_px(HALF_COURT_X, 0), ft_to_px(HALF_COURT_X, COURT_WIDTH),
+        LINE_COLOR, line_t,
+    )
+    # Half of the center circle that's on this side
+    center = ft_to_px(HALF_COURT_X, COURT_WIDTH / 2)
+    r_center = ft_to_radius(CENTER_CIRCLE_RADIUS)
+    if side == "left":
+        cv2.ellipse(img, center, (r_center, r_center), 0, 90, 270, LINE_COLOR, line_t)
+    else:
+        cv2.ellipse(img, center, (r_center, r_center), 0, -90, 90, LINE_COLOR, line_t)
+
+    # ── Paint, 3pt arc, restricted area, basket — only for this side ─────
+    _draw_key(img, ft_to_px, ft_to_radius, line_t, side=side)
+    _draw_three_point(img, ft_to_px, ft_to_radius, line_t, side=side)
+    _draw_restricted_area(img, ft_to_px, ft_to_radius, line_t, side=side)
+    _draw_basket(img, ft_to_px, ft_to_radius, line_t, side=side)
+
+    return img
+
+
 if __name__ == "__main__":
     court = generate_court_image()
     cv2.imwrite("court_template.png", court)
     print(f"Court template saved: {court.shape[1]}x{court.shape[0]}")
+    half_l = generate_half_court_image("left")
+    half_r = generate_half_court_image("right")
+    cv2.imwrite("court_template_half_left.png", half_l)
+    cv2.imwrite("court_template_half_right.png", half_r)
+    print(f"Half-court templates: {half_l.shape[1]}x{half_l.shape[0]}")

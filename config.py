@@ -50,6 +50,19 @@ class Config:
     minimap_height: int = 250
     minimap_padding: int = 10
     trail_length: int = 15
+    # Half-court minimap — square-ish since one half is 47x50 ft.
+    half_minimap_width: int = 470
+    half_minimap_height: int = 500
+
+    # Composite layout — which minimap(s) to render alongside the broadcast.
+    # "full"  = full-court only (legacy)
+    # "half"  = active half only, 2x scale, auto-flipped from keypoints
+    # "both"  = full (top) + active half (bottom), stacked
+    view: str = "both"
+
+    # Active-half hysteresis — number of recent frames to consider before
+    # switching the rendered half. Higher = more stable but slower to react.
+    half_hysteresis_frames: int = 15
 
     # Team classification
     n_teams: int = 2  # 2 = just teams, 3 = teams + referees
@@ -90,6 +103,11 @@ class Config:
                  "self-hosted Roboflow inference-server (e.g. a friend's "
                  "DGX Spark on Tailscale): http://spark.tail-xxx.ts.net:9001",
         )
+        parser.add_argument(
+            "--view", choices=["full", "half", "both"], default="both",
+            help="Minimap layout: 'full' (full court only), 'half' (active "
+                 "half only, auto-flipped), or 'both' (stacked). Default: both.",
+        )
 
         args = parser.parse_args()
         return cls(
@@ -108,6 +126,7 @@ class Config:
             debug=args.debug,
             inference_backend=args.backend,
             inference_host=args.inference_host,
+            view=args.view,
         )
 
     @classmethod

@@ -6,7 +6,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import cv2
 import numpy as np
@@ -17,6 +17,7 @@ from detector import PlayerDetector, CourtKeypointDetector
 from tracker import PlayerTracker
 from mapper import CourtMapper, MappedPlayer
 from team_classifier import TeamClassifier
+from view_selector import ActiveHalfSelector
 from visualizer import CompositeRenderer
 
 
@@ -35,6 +36,9 @@ class Pipeline:
         self.tracker = PlayerTracker(config)
         self.mapper = CourtMapper(config)
         self.team_classifier = TeamClassifier(n_teams=config.n_teams)
+        self.half_selector = ActiveHalfSelector(
+            history_frames=config.half_hysteresis_frames,
+        )
 
         # Video info (set in run())
         self.video_info = None
@@ -114,12 +118,16 @@ class Pipeline:
                 if h_valid:
                     valid_homography_count += 1
 
+                # 6.5 Pick active half from court keypoints (with hysteresis)
+                active_half = self.half_selector.update(keypoints)
+
                 # 7. Render composite frame
                 composite = self.renderer.render(
                     frame,
                     self.tracker.last_sv_detections,
                     mapped_players,
                     h_valid,
+                    active_half=active_half,
                     keypoints=keypoints if self.config.debug else None,
                 )
 
@@ -133,6 +141,7 @@ class Pipeline:
                     mapped_players=mapped_players,
                     homography_valid=h_valid,
                     keypoints_detected=len(keypoints),
+                    active_half=active_half,
                 )
                 all_frame_data.append(frame_data)
 
@@ -189,12 +198,14 @@ class Pipeline:
         mapped_players: List[MappedPlayer],
         homography_valid: bool,
         keypoints_detected: int,
+        active_half: Optional[str] = None,
     ) -> dict:
         return {
             "frame": frame_idx,
             "timestamp_ms": round(timestamp_ms, 1),
             "homography_valid": homography_valid,
             "keypoints_detected": keypoints_detected,
+            "active_half": active_half,
             "players": [
                 {
                     "track_id": p.track_id,
