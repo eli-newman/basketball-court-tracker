@@ -153,6 +153,14 @@ class PlayerDetector:
                 continue
             x, y = pred["x"], pred["y"]
             w, h = pred["width"], pred["height"]
+
+            # Sanity filter: drop boxes that don't look like a standing player.
+            # Crowd / sideline false positives are usually small or wide.
+            if h < self.config.min_player_bbox_height:
+                continue
+            if w > 0 and (h / w) < self.config.min_player_aspect_ratio:
+                continue
+
             x1, y1 = x - w / 2, y - h / 2
             x2, y2 = x + w / 2, y + h / 2
 

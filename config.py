@@ -27,6 +27,11 @@ class Config:
     player_model_id: str = "basketball-player-detection-3-ycjdo/6"
     player_confidence: float = 0.4
     nms_iou_threshold: float = 0.5  # de-dup overlapping boxes the model's NMS missed
+    # Sanity filters applied at detection time (before tracking) so phantom
+    # detections (people in the crowd, coaches on the sideline) don't pollute
+    # the tracker's ID assignment.
+    min_player_bbox_height: int = 30   # pixels — drops tiny far-distance/crowd boxes
+    min_player_aspect_ratio: float = 1.0   # height/width — drops wide horizontal blobs
 
     # Court keypoint detection
     court_model_id: str = "basketball-court-detection-2/13"

@@ -16,16 +16,22 @@ from detector import PlayerDetection
 class TeamClassifier:
     """Classifies players into teams based on jersey color."""
 
-    def __init__(self, n_teams: int = 2):
+    def __init__(self, n_teams: int = 2, warmup_frames: int = 15, min_saturation: int = 60):
         """
         Args:
             n_teams: Number of teams to cluster (2 = just teams, 3 = teams + refs).
+            warmup_frames: Frames of samples to collect before fitting KMeans.
+                Larger = more stable initial fit at the cost of late team_id labels.
+            min_saturation: HSV saturation threshold for "this is a team color"
+                pixels. Drops washed-out whites/grays in the torso crop, so
+                Knicks blue and 76ers red are not diluted by jersey trim/white.
         """
         self.n_teams = n_teams
         self._kmeans: Optional[KMeans] = None
         self._calibrated = False
         self._color_samples: List[np.ndarray] = []
-        self._warmup_frames = 5  # collect samples before first fit
+        self._warmup_frames = warmup_frames
+        self._min_saturation = min_saturation
         self._frame_count = 0
 
     def classify(
@@ -68,49 +74,54 @@ class TeamClassifier:
     ) -> np.ndarray:
         """Extract the dominant jersey color from a player's bounding box.
 
-        Crops the upper-middle portion of the bbox (torso area) to avoid
-        shorts, shoes, and the court floor.
+        Crops the jersey chest region (upper torso, between the chin and the
+        waistband, center horizontal strip — no shoulders/arms either since
+        sleeve color often differs from chest color). Then computes the median
+        HSV across "team color" pixels — those with saturation above
+        `min_saturation`, so white/gray jersey areas don't drown out the team
+        accent. Median (not mean) is robust to skin tone leakage.
         """
         x1, y1, x2, y2 = [int(v) for v in player.bbox]
         h, w = frame.shape[:2]
-
-        # Clamp to frame bounds
         x1 = max(0, min(x1, w - 1))
         x2 = max(0, min(x2, w - 1))
         y1 = max(0, min(y1, h - 1))
         y2 = max(0, min(y2, h - 1))
-
         if x2 <= x1 or y2 <= y1:
-            return np.array([128, 128, 128], dtype=np.float32)
+            return np.array([0, 0, 128], dtype=np.float32)
 
-        # Crop the torso: top 30-70% of bbox height, middle 20-80% width
+        # Jersey chest ROI: 20-45% vertical (below chin, above waistband),
+        # center 50% horizontal (skip sleeves & background).
         bh = y2 - y1
         bw = x2 - x1
-        torso_y1 = y1 + int(bh * 0.2)
-        torso_y2 = y1 + int(bh * 0.6)
-        torso_x1 = x1 + int(bw * 0.2)
-        torso_x2 = x2 - int(bw * 0.2)
-
-        if torso_y2 <= torso_y1 or torso_x2 <= torso_x1:
+        cy1 = y1 + int(bh * 0.20)
+        cy2 = y1 + int(bh * 0.45)
+        cx1 = x1 + int(bw * 0.25)
+        cx2 = x2 - int(bw * 0.25)
+        if cy2 <= cy1 or cx2 <= cx1:
             crop = frame[y1:y2, x1:x2]
         else:
-            crop = frame[torso_y1:torso_y2, torso_x1:torso_x2]
-
+            crop = frame[cy1:cy2, cx1:cx2]
         if crop.size == 0:
-            return np.array([128, 128, 128], dtype=np.float32)
+            return np.array([0, 0, 128], dtype=np.float32)
 
-        # Convert to HSV for better color discrimination
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        s = hsv[:, :, 1]
+        v = hsv[:, :, 2]
 
-        # Filter out very dark pixels (shadows, dark court) and very bright (highlights)
-        mask = (hsv[:, :, 2] > 40) & (hsv[:, :, 2] < 240)
-        if mask.sum() < 10:
-            # Not enough valid pixels, use full crop
-            mean_color = hsv.reshape(-1, 3).mean(axis=0)
+        # Keep saturated, mid-brightness pixels. These are the team-colored
+        # pixels (jersey accent / numbers), not skin, shadow, or white trim.
+        mask = (s >= self._min_saturation) & (v > 50) & (v < 240)
+
+        if mask.sum() >= 10:
+            pixels = hsv[mask]
         else:
-            mean_color = hsv[mask].mean(axis=0)
+            # Fall back to full crop (player wearing nearly-white jersey)
+            pixels = hsv.reshape(-1, 3)
 
-        return mean_color.astype(np.float32)
+        # Median is robust against the few skin/court pixels that slip in.
+        color = np.median(pixels, axis=0)
+        return color.astype(np.float32)
 
     def _fit_kmeans(self):
         """Fit KMeans on collected color samples."""
