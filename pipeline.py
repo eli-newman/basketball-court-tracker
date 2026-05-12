@@ -18,6 +18,7 @@ from tracker import PlayerTracker
 from mapper import CourtMapper, MappedBall, MappedPlayer
 from possession import PossessionTracker
 from events import EventDetector, ShotEvent
+from scoreboard import Scoreboard
 from team_classifier import TeamClassifier, resolve_team_profile
 from jersey import (
     JerseyNumberRecognizer, JerseyRead, JerseyVoter,
@@ -52,6 +53,7 @@ class Pipeline:
             shot_confirm_at=config.shot_confirm_at,
             made_window_frames=config.made_window_frames,
         )
+        self.scoreboard = Scoreboard(n_teams=config.n_teams)
         self.half_selector = ActiveHalfSelector(
             history_frames=config.half_hysteresis_frames,
         )
@@ -215,6 +217,11 @@ class Pipeline:
                     mapped_players=mapped_players,
                 )
 
+                # 6.37 Scoreboard: turn the (possibly newly extended) shot
+                #      event list into cumulative scores. Internal dedupe so
+                #      replaying the full list every frame is cheap.
+                self.scoreboard.update(self.events.events)
+
                 # 6.4 Jersey OCR on unlocked tracks (every Nth frame per track)
                 if self.jersey_recognizer is not None:
                     self._update_jersey_numbers(frame, mapped_players, frame_count)
@@ -234,6 +241,8 @@ class Pipeline:
                     mapped_ball=mapped_ball,
                     shot_events=self.events.events,
                     current_frame=frame_count,
+                    scoreboard=self.scoreboard,
+                    team_labels=self._team_labels_map(),
                 )
 
                 # 8. Write frame
@@ -269,23 +278,84 @@ class Pipeline:
         self._save_json(all_frame_data, json_out)
         self._save_csv(all_frame_data, csv_out)
 
-        # Save shot/event log
+        # Save shot/event log + scoreboard
         events_out = os.path.join(self.config.output_dir, "output_events.json")
         self._save_events(self.events.events, events_out)
+        scoreboard_out = os.path.join(self.config.output_dir, "output_scoreboard.json")
+        self._save_scoreboard(scoreboard_out)
 
         # Print summary
         n_events = len(self.events.events)
         made = sum(1 for e in self.events.events if e.made)
+        score_state = self.scoreboard.state
+        score_summary = " - ".join(
+            f"{self._team_label(t)} {score_state.score_by_team.get(t, 0)}"
+            for t in sorted(score_state.score_by_team)
+        )
         print()
         print("=" * 60)
         print(f"Done! Processed {processed} frames in {elapsed:.1f}s ({processed / elapsed:.1f} fps)")
         print(f"Homography valid: {valid_homography_count}/{processed} frames ({valid_homography_count / max(processed, 1) * 100:.0f}%)")
         print(f"Shot events: {n_events} ({made} made, {n_events - made} missed)")
-        print(f"Output video:  {video_out}")
-        print(f"Output JSON:   {json_out}")
-        print(f"Output CSV:    {csv_out}")
-        print(f"Output events: {events_out}")
+        print(f"Final score: {score_summary}")
+        print(f"Output video:      {video_out}")
+        print(f"Output JSON:       {json_out}")
+        print(f"Output CSV:        {csv_out}")
+        print(f"Output events:     {events_out}")
+        print(f"Output scoreboard: {scoreboard_out}")
         print("=" * 60)
+
+    def _team_labels_map(self) -> dict:
+        """Map of team_id → display label for each known team.
+
+        Empty when no team names were configured (KMeans mode); the
+        visualizer falls back to "T0"/"T1" in that case.
+        """
+        return {
+            tid: self._team_label(tid) for tid in range(self.config.n_teams)
+        }
+
+    def _team_label(self, team_id: int) -> str:
+        """Display name for a team in the summary line.
+
+        Uses the canonical team name from the classifier when available
+        (e.g. "knicks"), falls back to "T<n>" otherwise.
+        """
+        names = getattr(self.team_classifier, "_team_names", None)
+        if names is not None and 0 <= team_id < len(names):
+            return names[team_id].upper()[:5]
+        return f"T{team_id}"
+
+    def _save_scoreboard(self, path: str):
+        """Persist final score + per-shot breakdown to JSON."""
+        history = self.scoreboard.history
+        payload = {
+            "score_by_team": self.scoreboard.state.score_by_team,
+            "team_labels": {
+                i: self._team_label(i) for i in self.scoreboard.state.score_by_team
+            },
+            "unattributed_points": self.scoreboard.state.unattributed_points,
+            "shots": [
+                {
+                    "shooter_track_id": s.event.shooter_track_id,
+                    "team_id": s.event.team_id,
+                    "shot_type": s.event.shot_type,
+                    "made": s.event.made,
+                    "points": s.points,
+                    "rim_side": s.rim_side,
+                    "frame_end": s.event.frame_end,
+                    "court_x": (
+                        round(s.event.court_x, 2) if s.event.court_x is not None else None
+                    ),
+                    "court_y": (
+                        round(s.event.court_y, 2) if s.event.court_y is not None else None
+                    ),
+                }
+                for s in history
+            ],
+        }
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
 
     def _save_events(self, events: List[ShotEvent], path: str):
         """Persist the shot-event log as JSON. One entry per attempt."""

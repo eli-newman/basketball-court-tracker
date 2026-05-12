@@ -13,6 +13,7 @@ from court_template import generate_court_image, generate_half_court_image
 from detector import BallDetection
 from events import ShotEvent
 from mapper import MappedBall, MappedPlayer
+from scoreboard import Scoreboard
 
 # Visualization constants for the ball.
 _BALL_BGR = (40, 140, 255)        # broadcast-orange
@@ -21,6 +22,11 @@ _BALL_OUTLINE_BGR = (0, 0, 0)     # black ring for contrast on any background
 # Shot-marker colors on the minimap (BGR).
 _MADE_BGR = (60, 200, 60)         # green
 _MISSED_BGR = (60, 60, 220)       # red
+
+# Scoreboard panel layout (top-right of broadcast frame).
+_SCOREBOARD_PAD = 12
+_SCOREBOARD_BG = (30, 30, 30)
+_SCOREBOARD_TEXT = (240, 240, 240)
 
 
 class MinimapRenderer:
@@ -317,11 +323,15 @@ class OverlayRenderer:
         ball: Optional[BallDetection] = None,
         shot_events: Optional[List[ShotEvent]] = None,
         current_frame: int = 0,
+        scoreboard: Optional[Scoreboard] = None,
+        team_labels: Optional[Dict[int, str]] = None,
     ) -> np.ndarray:
         """Draw team-colored boxes + track ID labels + ball + possession ring.
 
         If a shot event ended within the last `_BANNER_PERSIST_FRAMES`
         frames, also render a green/red banner along the top of the frame.
+        If a scoreboard is supplied, render a small score panel in the
+        top-right corner.
         """
         annotated = frame.copy()
 
@@ -384,6 +394,12 @@ class OverlayRenderer:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1,
                 )
 
+        # Scoreboard panel — top-right corner. Compact "KNI 14  SIX 12"
+        # rendered against a dark background so it's readable on any
+        # broadcast frame.
+        if scoreboard is not None:
+            self._draw_scoreboard(annotated, scoreboard, team_labels)
+
         # Recent-shot banner — flash MADE/MISSED across the top of the
         # frame for a short window after the event resolves. Picks the
         # most recent event still in-window so simultaneous events
@@ -395,13 +411,27 @@ class OverlayRenderer:
             ]
             if recent:
                 ev = recent[-1]
-                text = "SHOT MADE" if ev.made else "SHOT MISSED"
                 color = _MADE_BGR if ev.made else _MISSED_BGR
                 shooter = (
                     f"#{ev.shooter_track_id}"
                     if ev.shooter_track_id >= 0
                     else "?"
                 )
+                # Look up the point value via the scoreboard's history if
+                # available — that's the source of truth (it does the
+                # 2-vs-3 geometry check).
+                points: Optional[int] = None
+                if scoreboard is not None:
+                    for s in reversed(scoreboard.history):
+                        if s.event is ev:
+                            points = s.points
+                            break
+                if ev.made:
+                    text = (
+                        f"SHOT MADE +{points}" if points else "SHOT MADE"
+                    )
+                else:
+                    text = "SHOT MISSED"
                 full = f"{text}  {shooter}  ({ev.shot_type})"
                 (tw, th), _ = cv2.getTextSize(
                     full, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2,
@@ -417,6 +447,83 @@ class OverlayRenderer:
                 )
 
         return annotated
+
+    def _draw_scoreboard(
+        self,
+        frame: np.ndarray,
+        scoreboard: Scoreboard,
+        team_labels: Optional[Dict[int, str]],
+    ):
+        """Render a compact scoreboard panel in the top-right corner.
+
+        Layout: dark panel with team-colored team labels + scores side
+        by side. Lives in the broadcast frame (NOT the right-panel
+        minimap area) so it stays visible regardless of view mode.
+
+        Mutates `frame` in place.
+        """
+        state = scoreboard.state
+        if not state.score_by_team:
+            return
+
+        teams = sorted(state.score_by_team)
+
+        # Build the display strings + colors per team.
+        items = []
+        for tid in teams:
+            label = (
+                (team_labels or {}).get(tid)
+                or f"T{tid}"
+            )
+            score = state.score_by_team.get(tid, 0)
+            color = self._TEAM_BGR.get(tid, self._TEAM_BGR[-1])
+            items.append((label[:5].upper(), score, color))
+
+        # Layout math. Each item is "LABEL  SCORE" with the LABEL in team
+        # color and SCORE in plain text. Total panel width: sum of item
+        # widths + separator gaps + padding.
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        label_scale = 0.7
+        score_scale = 0.9
+        label_thick = 2
+        score_thick = 2
+        gap = 18  # horizontal gap between teams
+
+        per_item_widths = []
+        max_h = 0
+        for label, score, _ in items:
+            (lw, lh), _ = cv2.getTextSize(label, font, label_scale, label_thick)
+            (sw, sh), _ = cv2.getTextSize(str(score), font, score_scale, score_thick)
+            item_w = lw + 8 + sw
+            per_item_widths.append((lw, sw, item_w, max(lh, sh)))
+            max_h = max(max_h, lh, sh)
+
+        panel_w = sum(w for _, _, w, _ in per_item_widths) + gap * (len(items) - 1) + _SCOREBOARD_PAD * 2
+        panel_h = max_h + _SCOREBOARD_PAD * 2
+
+        # Anchor top-right with a small inset.
+        fh, fw = frame.shape[:2]
+        x0 = fw - panel_w - 10
+        y0 = 10
+        if x0 < 0:
+            x0 = 0
+        x1 = x0 + panel_w
+        y1 = y0 + panel_h
+
+        # Translucent dark background — blend a filled rect so the score
+        # is readable against any broadcast color underneath.
+        bg = frame[y0:y1, x0:x1].copy()
+        cv2.rectangle(bg, (0, 0), (panel_w, panel_h), _SCOREBOARD_BG, -1)
+        cv2.addWeighted(bg, 0.75, frame[y0:y1, x0:x1], 0.25, 0, frame[y0:y1, x0:x1])
+
+        # Draw each team.
+        cursor = x0 + _SCOREBOARD_PAD
+        text_y = y0 + _SCOREBOARD_PAD + max_h - 2
+        for (label, score, color), (lw, sw, _item_w, _h) in zip(items, per_item_widths):
+            cv2.putText(frame, label, (cursor, text_y), font, label_scale, color, label_thick)
+            cursor += lw + 8
+            cv2.putText(frame, str(score), (cursor, text_y), font, score_scale, _SCOREBOARD_TEXT, score_thick)
+            cursor += sw + gap
 
 
 class CompositeRenderer:
@@ -459,6 +566,8 @@ class CompositeRenderer:
         mapped_ball: Optional[MappedBall] = None,
         shot_events: Optional[List[ShotEvent]] = None,
         current_frame: int = 0,
+        scoreboard: Optional[Scoreboard] = None,
+        team_labels: Optional[Dict[int, str]] = None,
     ) -> np.ndarray:
         annotated = self.overlay.render(
             frame, sv_detections, mapped_players,
@@ -466,6 +575,8 @@ class CompositeRenderer:
             ball=ball,
             shot_events=shot_events,
             current_frame=current_frame,
+            scoreboard=scoreboard,
+            team_labels=team_labels,
         )
 
         right_panel = self._render_right_panel(
