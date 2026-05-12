@@ -20,7 +20,7 @@ This module fixes both by:
 """
 
 from collections import deque
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -31,6 +31,118 @@ from detector import PlayerDetection
 
 # Sentinel for "no team yet" — used until enough data is collected to fit.
 UNKNOWN_TEAM = -1
+
+
+# ── Canonical NBA team color signatures ─────────────────────────────────────
+# Each profile is a 7-D vector matching the feature order produced by
+# `_extract_jersey_color`: [orange, red, blue, green, purple, yellow, dark_body].
+# Values are rough expected proportions of chest pixels in each bucket given
+# the team's primary uniform palette. Exact magnitudes don't matter — we use
+# cosine similarity, so direction (which buckets are non-zero) is what counts.
+#
+# Add new teams as needed; supervised classification only requires that the
+# two teams in the matchup have distinguishable color profiles.
+TEAM_PROFILES: Dict[str, np.ndarray] = {
+    # Eastern Conference
+    "knicks":    np.array([0.4, 0.0, 0.4, 0.0, 0.0, 0.0, 0.5], dtype=np.float32),
+    "sixers":    np.array([0.0, 0.7, 0.2, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+    "celtics":   np.array([0.0, 0.0, 0.0, 0.8, 0.0, 0.0, 0.0], dtype=np.float32),
+    "bulls":     np.array([0.0, 0.6, 0.0, 0.0, 0.0, 0.0, 0.3], dtype=np.float32),
+    "heat":      np.array([0.0, 0.7, 0.0, 0.0, 0.0, 0.0, 0.2], dtype=np.float32),
+    "bucks":     np.array([0.0, 0.0, 0.0, 0.7, 0.0, 0.0, 0.2], dtype=np.float32),
+    "pistons":   np.array([0.0, 0.4, 0.5, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+    "hawks":     np.array([0.0, 0.7, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+    "magic":     np.array([0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.2], dtype=np.float32),
+    "pacers":    np.array([0.0, 0.0, 0.4, 0.0, 0.0, 0.5, 0.0], dtype=np.float32),
+    "nets":      np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.6], dtype=np.float32),
+    "raptors":   np.array([0.0, 0.7, 0.0, 0.0, 0.0, 0.0, 0.2], dtype=np.float32),
+    "cavs":      np.array([0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5], dtype=np.float32),  # wine/gold
+    "wizards":   np.array([0.0, 0.4, 0.5, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+    "hornets":   np.array([0.0, 0.0, 0.0, 0.0, 0.6, 0.0, 0.2], dtype=np.float32),
+
+    # Western Conference
+    "lakers":    np.array([0.0, 0.0, 0.0, 0.0, 0.6, 0.4, 0.0], dtype=np.float32),
+    "warriors":  np.array([0.0, 0.0, 0.4, 0.0, 0.0, 0.5, 0.2], dtype=np.float32),
+    "nuggets":   np.array([0.0, 0.0, 0.5, 0.0, 0.0, 0.4, 0.0], dtype=np.float32),
+    "mavs":      np.array([0.0, 0.0, 0.7, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+    "kings":     np.array([0.0, 0.0, 0.0, 0.0, 0.7, 0.0, 0.0], dtype=np.float32),
+    "thunder":   np.array([0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.3], dtype=np.float32),
+    "rockets":   np.array([0.0, 0.7, 0.0, 0.0, 0.0, 0.0, 0.2], dtype=np.float32),
+    "jazz":      np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.7, 0.0], dtype=np.float32),
+    "suns":      np.array([0.4, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0], dtype=np.float32),
+    "blazers":   np.array([0.0, 0.6, 0.0, 0.0, 0.0, 0.0, 0.2], dtype=np.float32),
+    "spurs":     np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5], dtype=np.float32),  # black/white
+    "grizzlies": np.array([0.0, 0.0, 0.4, 0.0, 0.0, 0.0, 0.4], dtype=np.float32),
+    "pelicans":  np.array([0.0, 0.4, 0.0, 0.0, 0.0, 0.0, 0.3], dtype=np.float32),
+    "wolves":    np.array([0.0, 0.0, 0.5, 0.4, 0.0, 0.0, 0.2], dtype=np.float32),
+    "clippers":  np.array([0.0, 0.4, 0.4, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+}
+
+# Display BGR for each team (used by team_colors_bgr in anchored mode).
+TEAM_DISPLAY_BGR: Dict[str, Tuple[int, int, int]] = {
+    "knicks":    (200, 100, 30),
+    "sixers":    (40, 40, 220),
+    "celtics":   (40, 180, 40),
+    "bulls":     (60, 40, 200),
+    "heat":      (40, 60, 200),
+    "bucks":     (40, 100, 40),
+    "pistons":   (180, 40, 40),
+    "hawks":     (40, 40, 220),
+    "magic":     (200, 100, 40),
+    "pacers":    (40, 80, 220),
+    "nets":      (60, 30, 30),
+    "raptors":   (40, 40, 200),
+    "cavs":      (40, 30, 140),
+    "wizards":   (180, 40, 40),
+    "hornets":   (200, 40, 160),
+    "lakers":    (200, 40, 160),
+    "warriors":  (180, 100, 30),
+    "nuggets":   (140, 60, 40),
+    "mavs":      (220, 100, 40),
+    "kings":     (180, 40, 140),
+    "thunder":   (200, 120, 40),
+    "rockets":   (40, 40, 200),
+    "jazz":      (60, 60, 60),
+    "suns":      (40, 100, 220),
+    "blazers":   (40, 40, 200),
+    "spurs":     (180, 180, 180),
+    "grizzlies": (140, 100, 60),
+    "pelicans":  (60, 30, 100),
+    "wolves":    (140, 100, 30),
+    "clippers":  (200, 40, 60),
+}
+
+
+def resolve_team_profile(name: str) -> Optional[np.ndarray]:
+    """Look up a team's canonical color signature, case-insensitive.
+
+    Returns None if the name isn't in the registry — caller decides whether
+    that's a hard error or a "fall back to KMeans" signal.
+    """
+    if not name:
+        return None
+    key = name.strip().lower()
+    return TEAM_PROFILES.get(key)
+
+
+def _nearest_anchor_cosine(X: np.ndarray, anchors: np.ndarray) -> np.ndarray:
+    """For each row in X, return the index of the anchor with highest cosine sim.
+
+    Args:
+        X: (n_tracks, F) feature matrix.
+        anchors: (n_teams, F) anchor matrix.
+
+    Returns:
+        (n_tracks,) integer labels in [0, n_teams).
+    """
+    # Normalize rows (guard against all-zero vectors — fall back to a tiny
+    # epsilon so cos = 0 and the first anchor wins by tiebreak).
+    x_norms = np.linalg.norm(X, axis=1, keepdims=True) + 1e-9
+    a_norms = np.linalg.norm(anchors, axis=1, keepdims=True) + 1e-9
+    Xn = X / x_norms
+    An = anchors / a_norms
+    sims = Xn @ An.T  # (n_tracks, n_teams)
+    return np.argmax(sims, axis=1)
 
 
 class TeamClassifier:
@@ -44,6 +156,8 @@ class TeamClassifier:
         samples_per_track: int = 30,
         refit_every: int = 10,
         min_samples_to_classify: int = 3,
+        team_anchors: Optional[Sequence[np.ndarray]] = None,
+        team_names: Optional[Sequence[str]] = None,
     ):
         """
         Args:
@@ -59,6 +173,16 @@ class TeamClassifier:
                 tracks that appear later.
             min_samples_to_classify: A track needs at least this many color
                 samples before it's eligible to be clustered.
+            team_anchors: Optional list of N=n_teams canonical color signatures
+                (each a 7-D vector matching the feature order of
+                `_extract_jersey_color`). If provided, the classifier skips
+                KMeans entirely and assigns each track to the anchor with the
+                highest cosine similarity to its median. This is the
+                "supervised" mode — use it whenever you know which two teams
+                are playing (which is always true for NBA broadcasts).
+            team_names: Optional list of N display names aligned with
+                `team_anchors`. Used by `team_colors_bgr` to look up canonical
+                BGR colors in `TEAM_DISPLAY_BGR`.
         """
         self.n_teams = n_teams
         self._kmeans: Optional[KMeans] = None
@@ -68,6 +192,23 @@ class TeamClassifier:
         self._samples_per_track = samples_per_track
         self._refit_every = refit_every
         self._min_samples_to_classify = min_samples_to_classify
+
+        # Supervised mode state
+        self._team_anchors: Optional[np.ndarray] = None
+        self._team_names: Optional[List[str]] = None
+        if team_anchors is not None:
+            anchors = np.stack([np.asarray(a, dtype=np.float32) for a in team_anchors], axis=0)
+            if anchors.shape[0] != n_teams:
+                raise ValueError(
+                    f"team_anchors has {anchors.shape[0]} rows but n_teams={n_teams}"
+                )
+            self._team_anchors = anchors
+            if team_names is not None:
+                if len(team_names) != n_teams:
+                    raise ValueError(
+                        f"team_names has {len(team_names)} entries but n_teams={n_teams}"
+                    )
+                self._team_names = list(team_names)
 
         # Per-track state
         self._track_samples: Dict[int, Deque[np.ndarray]] = {}
@@ -231,7 +372,12 @@ class TeamClassifier:
         )
 
     def _refit(self):
-        """Recluster tracks: one median sample per track, fit, assign."""
+        """Recluster tracks: one median sample per track, fit, assign.
+
+        Branches on `_team_anchors`:
+          - Anchored: nearest-anchor by cosine similarity (no KMeans).
+          - Unanchored: KMeans over per-track medians.
+        """
         # Build "track_id -> median color" using only tracks with enough samples.
         track_ids: List[int] = []
         track_colors: List[np.ndarray] = []
@@ -241,10 +387,28 @@ class TeamClassifier:
             track_ids.append(tid)
             track_colors.append(np.median(np.stack(samples, axis=0), axis=0))
 
-        if len(track_colors) < self.n_teams:
-            return  # not enough distinct tracks yet to cluster
+        if not track_colors:
+            return
 
         X = np.stack(track_colors, axis=0)
+
+        if self._team_anchors is not None:
+            # Supervised: each track → nearest team anchor by cosine similarity.
+            # Cosine is scale-invariant, so it just asks "which colors are
+            # present?" rather than "how saturated is the sample?" — that's
+            # what we want when broadcast lighting varies frame to frame.
+            labels = _nearest_anchor_cosine(X, self._team_anchors)
+            self._track_assignments = {
+                int(tid): int(label) for tid, label in zip(track_ids, labels)
+            }
+            self._calibrated = True
+            self._log_anchored_assignments()
+            return
+
+        # Unsupervised: KMeans. Needs at least n_teams distinct tracks.
+        if len(track_colors) < self.n_teams:
+            return
+
         kmeans = KMeans(n_clusters=self.n_teams, n_init=10, random_state=42)
         kmeans.fit(X)
         labels = kmeans.predict(X)
@@ -263,6 +427,17 @@ class TeamClassifier:
             top = sorted(enumerate(center), key=lambda x: -x[1])[:3]
             sig = " ".join(f"{names[j]}={frac:.2f}" for j, frac in top if frac > 0.02)
             print(f"  Team {i}: {sig}  [{count} tracks]")
+
+    def _log_anchored_assignments(self):
+        """Print per-team track counts in supervised mode."""
+        for i in range(self.n_teams):
+            count = sum(1 for v in self._track_assignments.values() if v == i)
+            name = (
+                self._team_names[i]
+                if self._team_names is not None
+                else f"team {i}"
+            )
+            print(f"  {name}: {count} tracks")
 
     def refit(self):
         """Public force-refit (e.g., after a detected scene change)."""
@@ -286,10 +461,29 @@ class TeamClassifier:
 
     @property
     def team_colors_bgr(self) -> List[Tuple[int, int, int]]:
-        """Cluster centers as BGR — use the dominant color bucket per team."""
+        """Display BGR per team.
+
+        Anchored mode: use canonical NBA team colors via TEAM_DISPLAY_BGR.
+        Unsupervised mode: derive from each KMeans center's dominant bucket.
+        """
+        # Anchored mode: known team identities, return canonical colors.
+        if self._team_anchors is not None:
+            out: List[Tuple[int, int, int]] = []
+            for i in range(self.n_teams):
+                if self._team_names is not None:
+                    bgr = TEAM_DISPLAY_BGR.get(self._team_names[i].lower())
+                    if bgr is not None:
+                        out.append(bgr)
+                        continue
+                # Fall back to anchor's dominant bucket
+                top_bucket = int(np.argmax(self._team_anchors[i]))
+                out.append(self._BUCKET_BGR[top_bucket])
+            return out
+
+        # Unsupervised mode: KMeans hasn't fit yet → gray placeholders.
         if not self._calibrated or self._kmeans is None:
             return [(200, 200, 200)] * self.n_teams
-        out: List[Tuple[int, int, int]] = []
+        out = []
         for center in self._kmeans.cluster_centers_:
             top_bucket = int(np.argmax(center))
             out.append(self._BUCKET_BGR[top_bucket])

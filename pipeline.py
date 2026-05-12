@@ -16,7 +16,7 @@ from config import Config
 from detector import PlayerDetector, CourtKeypointDetector
 from tracker import PlayerTracker
 from mapper import CourtMapper, MappedPlayer
-from team_classifier import TeamClassifier
+from team_classifier import TeamClassifier, resolve_team_profile
 from jersey import (
     JerseyNumberRecognizer, JerseyRead, JerseyVoter,
     crop_chest, parse_jersey_response,
@@ -39,7 +39,7 @@ class Pipeline:
         self.court_detector = CourtKeypointDetector(config)
         self.tracker = PlayerTracker(config)
         self.mapper = CourtMapper(config)
-        self.team_classifier = TeamClassifier(n_teams=config.n_teams)
+        self.team_classifier = self._build_team_classifier(config)
         self.half_selector = ActiveHalfSelector(
             history_frames=config.half_hysteresis_frames,
         )
@@ -61,6 +61,43 @@ class Pipeline:
 
         # Two-worker pool: player + keypoint detection run concurrently per frame
         self._detector_pool = ThreadPoolExecutor(max_workers=2)
+
+    @staticmethod
+    def _build_team_classifier(config: Config) -> TeamClassifier:
+        """Construct the team classifier, switching to anchored mode when both
+        --team-a and --team-b resolve to known canonical color profiles.
+
+        Falls back to KMeans if either name is missing or unrecognised — we
+        warn but don't crash so the pipeline still runs on a clip where the
+        user didn't specify a matchup.
+        """
+        if not config.team_a or not config.team_b:
+            return TeamClassifier(n_teams=config.n_teams)
+
+        anchor_a = resolve_team_profile(config.team_a)
+        anchor_b = resolve_team_profile(config.team_b)
+        if anchor_a is None or anchor_b is None:
+            missing = []
+            if anchor_a is None:
+                missing.append(config.team_a)
+            if anchor_b is None:
+                missing.append(config.team_b)
+            print(
+                f"[team-classifier] Unknown team name(s): {missing}. "
+                "Falling back to unsupervised KMeans. See TEAM_PROFILES in "
+                "team_classifier.py for the list of recognised names."
+            )
+            return TeamClassifier(n_teams=config.n_teams)
+
+        print(
+            f"[team-classifier] Anchored mode: "
+            f"team 0 = {config.team_a}, team 1 = {config.team_b}"
+        )
+        return TeamClassifier(
+            n_teams=2,
+            team_anchors=[anchor_a, anchor_b],
+            team_names=[config.team_a, config.team_b],
+        )
 
     def run(self):
         """Process the full video and generate outputs."""

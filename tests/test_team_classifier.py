@@ -9,7 +9,13 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from detector import PlayerDetection
-from team_classifier import TeamClassifier, UNKNOWN_TEAM
+from team_classifier import (
+    TEAM_PROFILES,
+    TeamClassifier,
+    UNKNOWN_TEAM,
+    _nearest_anchor_cosine,
+    resolve_team_profile,
+)
 
 
 def _player(track_id: int, bbox: tuple) -> PlayerDetection:
@@ -148,3 +154,136 @@ def test_team_colors_bgr_returns_centers():
 def test_no_players_returns_empty():
     clf = TeamClassifier(n_teams=2, warmup_frames=1)
     assert clf.classify(_frame_with_two_jerseys(), []) == []
+
+
+# ── Supervised (anchored) mode ──────────────────────────────────────────────
+
+
+def test_resolve_team_profile_case_insensitive():
+    """Team names are stripped + lowercased before lookup."""
+    a = resolve_team_profile("Knicks")
+    b = resolve_team_profile("  KNICKS  ")
+    c = resolve_team_profile("knicks")
+    assert a is not None
+    np.testing.assert_array_equal(a, b)
+    np.testing.assert_array_equal(a, c)
+
+
+def test_resolve_team_profile_unknown_returns_none():
+    assert resolve_team_profile("not-a-team") is None
+    assert resolve_team_profile("") is None
+
+
+def test_all_team_profiles_have_consistent_shape():
+    """Every profile is 7-D so the feature vectors line up."""
+    for name, profile in TEAM_PROFILES.items():
+        assert profile.shape == (7,), f"{name} has wrong shape: {profile.shape}"
+
+
+def test_nearest_anchor_cosine_picks_obvious_match():
+    """Each track's feature vector should snap to its true anchor."""
+    anchors = np.stack(
+        [TEAM_PROFILES["knicks"], TEAM_PROFILES["sixers"]], axis=0,
+    )
+    # Synthetic tracks: one looks Knicks-ish, one looks Sixers-ish
+    tracks = np.array([
+        [0.3, 0.0, 0.4, 0.0, 0.0, 0.0, 0.4],  # blue body + orange + dark → Knicks
+        [0.0, 0.6, 0.1, 0.0, 0.0, 0.0, 0.0],  # red dominant → Sixers
+    ], dtype=np.float32)
+    labels = _nearest_anchor_cosine(tracks, anchors)
+    assert labels[0] == 0  # Knicks
+    assert labels[1] == 1  # Sixers
+
+
+def test_nearest_anchor_cosine_handles_zero_vector():
+    """A track that observed no saturated pixels gets a deterministic label."""
+    anchors = np.stack(
+        [TEAM_PROFILES["knicks"], TEAM_PROFILES["sixers"]], axis=0,
+    )
+    tracks = np.zeros((1, 7), dtype=np.float32)
+    labels = _nearest_anchor_cosine(tracks, anchors)
+    assert labels[0] in (0, 1)  # doesn't crash; picks one
+
+
+def test_anchored_classifier_skips_kmeans():
+    """In anchored mode, _kmeans is never set; assignments come from cosine."""
+    clf = TeamClassifier(
+        n_teams=2,
+        warmup_frames=1,
+        refit_every=1,
+        min_samples_to_classify=1,
+        team_anchors=[
+            TEAM_PROFILES["sixers"],  # red → matches the left half of the frame
+            TEAM_PROFILES["mavs"],    # blue → matches the right half
+        ],
+        team_names=["sixers", "mavs"],
+    )
+    frame = _frame_with_two_jerseys()  # left=red, right=blue
+    red_player = _player(1, (100, 100, 200, 600))
+    blue_player = _player(2, (900, 100, 1000, 600))
+
+    for _ in range(2):
+        out = clf.classify(frame, [red_player, blue_player])
+
+    assert clf.is_calibrated
+    assert clf._kmeans is None  # never fit
+    # The red player should land on team 0 (sixers), blue on team 1 (mavs).
+    assert out[0] == 0
+    assert out[1] == 1
+
+
+def test_anchored_classifier_works_with_single_track():
+    """KMeans needs n_teams tracks to fit; anchored mode does not."""
+    clf = TeamClassifier(
+        n_teams=2,
+        warmup_frames=1,
+        refit_every=1,
+        min_samples_to_classify=1,
+        team_anchors=[TEAM_PROFILES["sixers"], TEAM_PROFILES["mavs"]],
+        team_names=["sixers", "mavs"],
+    )
+    frame = _frame_with_two_jerseys()
+    red_only = _player(1, (100, 100, 200, 600))
+
+    for _ in range(2):
+        out = clf.classify(frame, [red_only])
+
+    # Should be assigned to team 0 (sixers/red) even with no second track.
+    assert clf.is_calibrated
+    assert out[0] == 0
+
+
+def test_anchored_classifier_team_colors_bgr_uses_canonical():
+    """When team_names are provided, team_colors_bgr returns canonical NBA BGRs."""
+    from team_classifier import TEAM_DISPLAY_BGR
+    clf = TeamClassifier(
+        n_teams=2,
+        warmup_frames=1,
+        refit_every=1,
+        min_samples_to_classify=1,
+        team_anchors=[TEAM_PROFILES["knicks"], TEAM_PROFILES["sixers"]],
+        team_names=["knicks", "sixers"],
+    )
+    colors = clf.team_colors_bgr
+    assert colors[0] == TEAM_DISPLAY_BGR["knicks"]
+    assert colors[1] == TEAM_DISPLAY_BGR["sixers"]
+
+
+def test_anchored_classifier_rejects_mismatched_anchor_count():
+    """team_anchors length must equal n_teams."""
+    import pytest
+    with pytest.raises(ValueError):
+        TeamClassifier(
+            n_teams=2,
+            team_anchors=[TEAM_PROFILES["knicks"]],  # only 1
+        )
+
+
+def test_anchored_classifier_rejects_mismatched_names_count():
+    import pytest
+    with pytest.raises(ValueError):
+        TeamClassifier(
+            n_teams=2,
+            team_anchors=[TEAM_PROFILES["knicks"], TEAM_PROFILES["sixers"]],
+            team_names=["knicks"],  # only 1
+        )

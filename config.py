@@ -83,6 +83,14 @@ class Config:
 
     # Team classification
     n_teams: int = 2  # 2 = just teams, 3 = teams + referees
+    # When both team names are set, the classifier uses canonical NBA color
+    # signatures (TEAM_PROFILES in team_classifier.py) and skips KMeans.
+    # Recommended for any clip where you know the matchup — KMeans is brittle
+    # on warm-on-warm matchups (Knicks orange vs Sixers red are 10° apart in
+    # hue and trip up an unsupervised cluster). Names are case-insensitive.
+    # Example: --team-a knicks --team-b sixers
+    team_a: Optional[str] = None
+    team_b: Optional[str] = None
 
     # Colors (BGR)
     color_team_a: tuple = (255, 100, 50)    # blue-ish
@@ -134,6 +142,19 @@ class Config:
             "--jersey-sample-every", type=int, default=5,
             help="Run jersey OCR every Nth frame per unlocked track.",
         )
+        parser.add_argument(
+            "--team-a", default=None,
+            help="Name of team 0 for supervised color classification "
+                 "(e.g. 'knicks'). When both --team-a and --team-b are set, "
+                 "the classifier skips KMeans and matches each track to the "
+                 "team with the closest canonical color signature. See "
+                 "TEAM_PROFILES in team_classifier.py for the full list.",
+        )
+        parser.add_argument(
+            "--team-b", default=None,
+            help="Name of team 1 for supervised color classification "
+                 "(e.g. 'sixers'). See --team-a.",
+        )
 
         args = parser.parse_args()
         return cls(
@@ -155,6 +176,8 @@ class Config:
             view=args.view,
             enable_jersey_ocr=args.jersey_ocr,
             jersey_sample_every=args.jersey_sample_every,
+            team_a=args.team_a,
+            team_b=args.team_b,
         )
 
     @classmethod
