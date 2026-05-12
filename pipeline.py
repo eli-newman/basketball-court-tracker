@@ -20,6 +20,8 @@ from mapper import CourtMapper, MappedBall, MappedPlayer
 from possession import PossessionTracker
 from events import EventDetector, ShotEvent
 from geo_shot import GeometricShotDetector
+from identity import PlayerIdentityRegistry
+from player_stats import PlayerStatsAggregator
 from scoreboard import Scoreboard
 from team_classifier import TeamClassifier, resolve_team_profile
 from jersey import (
@@ -82,6 +84,16 @@ class Pipeline:
                 confirm_at=config.jersey_confirm_at,
                 min_confidence=config.jersey_min_confidence,
             )
+
+        # Persistent identity: collapses (team_id, jersey_number) → stable
+        # player_id across camera cuts. Always present (cheap), but only
+        # populates when jersey OCR is enabled and locks a number.
+        self.identity = PlayerIdentityRegistry()
+
+        # Per-player stats (PTS / FGM / FGA) keyed by persistent player_id.
+        # Driven by the ShotEvent stream same as Scoreboard; renders a
+        # "top scorers" panel when we have identified shooters.
+        self.player_stats = PlayerStatsAggregator()
 
         # Video info (set in run())
         self.video_info = None
@@ -189,6 +201,11 @@ class Pipeline:
                     # the next "track 4" doesn't inherit the previous
                     # "track 4"'s color samples. Keeps fitted anchors.
                     self.team_classifier.reset_track_state()
+                    # Identity: drop track→player bindings (ByteTrack will
+                    # reissue ids), but keep the (team, number)→player
+                    # registry so jerseys from prior segments still
+                    # collapse to the same player when they reappear.
+                    self.identity.reset_track_bindings()
                     self.renderer.reset_for_cut()
                     print(
                         f"[cut] frame {frame_count}: camera cut detected "
@@ -272,10 +289,24 @@ class Pipeline:
                 #      list each frame without double-counting.
                 combined_events = self.events.events + self._geo_events
                 self.scoreboard.update(combined_events)
+                self.player_stats.update(combined_events)
 
                 # 6.4 Jersey OCR on unlocked tracks (every Nth frame per track)
                 if self.jersey_recognizer is not None:
                     self._update_jersey_numbers(frame, mapped_players, frame_count)
+
+                # 6.45 Resolve persistent player identity for every mapped
+                #      player. No-op until both team and jersey are known;
+                #      from then on, the same human gets the same player_id
+                #      across cuts so stats can be aggregated per player.
+                for mp in mapped_players:
+                    mp.player_id = self.identity.resolve(
+                        track_id=mp.track_id,
+                        team_id=mp.team_id,
+                        jersey_number=mp.jersey_number,
+                        jersey_locked=mp.jersey_locked,
+                        frame_idx=frame_count,
+                    )
 
                 # 6.5 Pick active half from court keypoints (with hysteresis)
                 active_half = self.half_selector.update(keypoints)
@@ -294,6 +325,8 @@ class Pipeline:
                     current_frame=frame_count,
                     scoreboard=self.scoreboard,
                     team_labels=self._team_labels_map(),
+                    player_stats=self.player_stats,
+                    identity=self.identity,
                 )
 
                 # 8. Write frame
@@ -335,6 +368,12 @@ class Pipeline:
         self._save_events(combined_events_final, events_out)
         scoreboard_out = os.path.join(self.config.output_dir, "output_scoreboard.json")
         self._save_scoreboard(scoreboard_out)
+        # Per-player stats (only meaningful when jersey OCR identified some
+        # shooters; otherwise the file is `{"players": []}`).
+        player_stats_out = os.path.join(
+            self.config.output_dir, "output_player_stats.json",
+        )
+        self._save_player_stats(player_stats_out)
 
         # Print summary
         n_events = len(combined_events_final)
@@ -359,6 +398,20 @@ class Pipeline:
         print(f"Output CSV:        {csv_out}")
         print(f"Output events:     {events_out}")
         print(f"Output scoreboard: {scoreboard_out}")
+        print(f"Output player-stats: {player_stats_out}")
+        # Per-player scoring summary (when jersey OCR populated identities).
+        top = self.player_stats.top_scorers(n=5)
+        if top:
+            print("Top scorers:")
+            for s in top:
+                p = self.identity.get(s.player_id)
+                label = f"#{p.jersey_number}" if p else f"P{s.player_id}"
+                team = self._team_label(s.team_id) if s.team_id >= 0 else "??"
+                print(
+                    f"  {team:>5}  {label:>5}  "
+                    f"{s.points:>3} PTS  {s.fgm}/{s.fga}  "
+                    f"({s.fg_pct * 100:.0f}%)"
+                )
         print("=" * 60)
         # Detector class histogram — surfaces "no action classes ever fired"
         # bugs that otherwise look like "shot detection is broken."
@@ -416,11 +469,48 @@ class Pipeline:
         with open(path, "w") as f:
             json.dump(payload, f, indent=2)
 
+    def _save_player_stats(self, path: str):
+        """Persist per-player counting stats to JSON.
+
+        Empty `players` list when no jersey-locked shooter was ever
+        attributed to a shot (i.e. OCR off, or off-screen at shot time).
+        """
+        rows = self.player_stats.all()
+        payload = {
+            "players": [
+                {
+                    "player_id": s.player_id,
+                    "team_id": s.team_id,
+                    "team": (
+                        self._team_label(s.team_id) if s.team_id >= 0 else None
+                    ),
+                    "jersey_number": (
+                        self.identity.get(s.player_id).jersey_number
+                        if self.identity.get(s.player_id) is not None
+                        else None
+                    ),
+                    "points": s.points,
+                    "fga": s.fga,
+                    "fgm": s.fgm,
+                    "fg_pct": round(s.fg_pct, 3),
+                    "fg2a": s.fg2a,
+                    "fg2m": s.fg2m,
+                    "fg3a": s.fg3a,
+                    "fg3m": s.fg3m,
+                    "fg3_pct": round(s.fg3_pct, 3),
+                }
+                for s in rows
+            ],
+        }
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+
     def _save_events(self, events: List[ShotEvent], path: str):
         """Persist the shot-event log as JSON. One entry per attempt."""
         payload = [
             {
                 "shooter_track_id": e.shooter_track_id,
+                "shooter_player_id": e.shooter_player_id,
                 "team_id": e.team_id,
                 "shot_type": e.shot_type,
                 "made": e.made,
@@ -531,6 +621,7 @@ class Pipeline:
                     "team_id": p.team_id,
                     "jersey_number": p.jersey_number,
                     "jersey_locked": p.jersey_locked,
+                    "player_id": p.player_id,
                     "has_ball": p.has_ball,
                 }
                 for p in mapped_players

@@ -70,6 +70,12 @@ class ShotEvent:
     block_track_id: Optional[int] = None  # if player-shot-block was tagged
                                            # against the same shot, the
                                            # blocker's track_id
+    shooter_player_id: Optional[int] = None  # persistent player_id from
+                                              # PlayerIdentityRegistry; None
+                                              # when the shooter's jersey
+                                              # number wasn't locked at shot
+                                              # time. Stable across camera
+                                              # cuts, unlike shooter_track_id.
 
 
 @dataclass
@@ -86,6 +92,7 @@ class _ShotInProgress:
     last_court_x: Optional[float] = None
     last_court_y: Optional[float] = None
     last_team_id: int = -1
+    last_player_id: Optional[int] = None  # persistent identity (when known)
 
 
 class EventDetector:
@@ -299,6 +306,7 @@ class EventDetector:
                     shot.last_court_x = mp.court_x
                     shot.last_court_y = mp.court_y
                     shot.last_team_id = mp.team_id
+                    shot.last_player_id = mp.player_id
                     break
 
     def _end_idle_shots(self) -> List[ShotEvent]:
@@ -355,6 +363,7 @@ class EventDetector:
             court_y=shot.last_court_y,
             team_id=shot.last_team_id,
             block_track_id=shot.block_track_id,
+            shooter_player_id=shot.last_player_id,
         ))
 
 

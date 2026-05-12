@@ -86,6 +86,7 @@ class _PendingShot:
     shooter_track_id: Optional[int]
     team_id: Optional[int]
     court_pos: Optional[Tuple[float, float]]
+    shooter_player_id: Optional[int] = None  # persistent identity at trigger
     saw_ball_below_rim: bool = False
 
 
@@ -185,7 +186,7 @@ class GeometricShotDetector:
             if just_entered and self._was_above_rim_recently(frame_idx):
                 # Find the rim the ball is inside; record it for resolution.
                 rim_bbox = self._first_rim_containing(bx, by, rims)
-                shooter_id, team_id, court_pos = self._attribute_shot(
+                shooter_id, team_id, court_pos, player_id = self._attribute_shot(
                     mapped_players,
                 )
                 self._pending = _PendingShot(
@@ -194,6 +195,7 @@ class GeometricShotDetector:
                     shooter_track_id=shooter_id,
                     team_id=team_id,
                     court_pos=court_pos,
+                    shooter_player_id=player_id,
                 )
         else:
             # Keep this flag honest even when we couldn't trigger,
@@ -226,6 +228,7 @@ class GeometricShotDetector:
             court_x=p.court_pos[0] if p.court_pos else None,
             court_y=p.court_pos[1] if p.court_pos else None,
             team_id=p.team_id if p.team_id is not None else -1,
+            shooter_player_id=p.shooter_player_id,
         )
         self._pending = None
         self._last_emit_frame = frame_idx
@@ -298,13 +301,16 @@ class GeometricShotDetector:
     def _attribute_shot(
         self,
         mapped_players: List[MappedPlayer],
-    ) -> Tuple[Optional[int], Optional[int], Optional[Tuple[float, float]]]:
-        """Find (shooter, team, court_pos) from recent-possessor history.
+    ) -> Tuple[
+        Optional[int], Optional[int], Optional[Tuple[float, float]], Optional[int],
+    ]:
+        """Find (shooter_track, team, court_pos, player_id) from recent
+        possessor history.
 
         Walk backwards through the possessor buffer; pick the first
         non-None possessor. If that track is still in mapped_players,
-        use their current court position; otherwise return court_pos =
-        None (the scoreboard will fall back to a 2-pointer default).
+        use their current court position + persistent player_id; otherwise
+        return court_pos = None and player_id = None.
         """
         shooter_id: Optional[int] = None
         for _frame, pid in reversed(self._possessor_history):
@@ -313,12 +319,17 @@ class GeometricShotDetector:
                 break
 
         if shooter_id is None:
-            return None, None, None
+            return None, None, None, None
 
         for mp in mapped_players:
             if mp.track_id == shooter_id:
-                return shooter_id, mp.team_id, (mp.court_x, mp.court_y)
+                return (
+                    shooter_id,
+                    mp.team_id,
+                    (mp.court_x, mp.court_y),
+                    mp.player_id,
+                )
 
         # Possessor track has gone out of view — keep the shooter ID but
-        # can't look up court position right now.
-        return shooter_id, None, None
+        # can't look up court position or persistent identity right now.
+        return shooter_id, None, None, None

@@ -31,6 +31,11 @@ class MappedPlayer:
     jersey_locked: bool = False          # True after the vote threshold
     has_ball: bool = False                # True when this player is the
                                           # confirmed possessor for the frame
+    player_id: Optional[int] = None       # persistent identity from
+                                          # PlayerIdentityRegistry; same number
+                                          # collapses to the same player across
+                                          # camera cuts. None until both
+                                          # team_id and jersey_locked are set.
 
 
 @dataclass

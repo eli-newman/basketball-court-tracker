@@ -12,7 +12,9 @@ from court import COURT_LENGTH, COURT_WIDTH, court_to_minimap, court_to_minimap_
 from court_template import generate_court_image, generate_half_court_image
 from detector import BallDetection
 from events import ShotEvent
+from identity import PlayerIdentityRegistry
 from mapper import MappedBall, MappedPlayer
+from player_stats import PlayerStats, PlayerStatsAggregator
 from scoreboard import Scoreboard
 
 # Visualization constants for the ball.
@@ -336,6 +338,8 @@ class OverlayRenderer:
         current_frame: int = 0,
         scoreboard: Optional[Scoreboard] = None,
         team_labels: Optional[Dict[int, str]] = None,
+        player_stats: Optional[PlayerStatsAggregator] = None,
+        identity: Optional[PlayerIdentityRegistry] = None,
     ) -> np.ndarray:
         """Draw team-colored boxes + track ID labels + ball + possession ring.
 
@@ -424,11 +428,19 @@ class OverlayRenderer:
             if recent:
                 ev = recent[-1]
                 color = _MADE_BGR if ev.made else _MISSED_BGR
-                shooter = (
-                    f"#{ev.shooter_track_id}"
-                    if ev.shooter_track_id >= 0
-                    else "?"
-                )
+                # Prefer the persistent identity (jersey #) when we have it
+                # so the banner reads the same across cuts; fall back to
+                # the ephemeral track ID otherwise.
+                shooter = "?"
+                if (
+                    identity is not None
+                    and ev.shooter_player_id is not None
+                ):
+                    pp = identity.get(ev.shooter_player_id)
+                    if pp is not None:
+                        shooter = f"#{pp.jersey_number}"
+                if shooter == "?" and ev.shooter_track_id >= 0:
+                    shooter = f"#{ev.shooter_track_id}"
                 # Look up the point value via the scoreboard's history if
                 # available — that's the source of truth (it does the
                 # 2-vs-3 geometry check).
@@ -458,7 +470,111 @@ class OverlayRenderer:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2,
                 )
 
+        # Top-scorers panel — bottom-left of the broadcast frame. Only
+        # renders when we have identified shooters (i.e. jersey OCR is on
+        # and has locked a number for at least one player who shot).
+        if player_stats is not None:
+            self._draw_top_scorers(annotated, player_stats, identity)
+
         return annotated
+
+    def _draw_top_scorers(
+        self,
+        frame: np.ndarray,
+        stats: PlayerStatsAggregator,
+        identity: Optional[PlayerIdentityRegistry],
+        max_rows: int = 4,
+    ):
+        """Compact "top scorers" panel anchored to the bottom-left.
+
+        Rows look like:  ▌#11  8 PTS  3/5
+        The colored bar on the left encodes team; numbers are jersey
+        numbers (persistent — same player across cuts). Hidden until at
+        least one identified shot has happened (otherwise it's noise).
+        """
+        rows = stats.top_scorers(n=max_rows)
+        if not rows:
+            return
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        title_scale, title_thick = 0.5, 1
+        row_scale, row_thick = 0.55, 1
+        pad_x, pad_y = 10, 8
+        row_gap = 6
+        bar_w = 4
+
+        title = "TOP SCORERS"
+        (tw, th), _ = cv2.getTextSize(title, font, title_scale, title_thick)
+
+        # Pre-render row strings so we can size the panel to fit.
+        row_strs: List[str] = []
+        for s in rows:
+            label = self._player_label(s, identity)
+            row_strs.append(f"{label}  {s.points} PTS  {s.fgm}/{s.fga}")
+        widths = [
+            cv2.getTextSize(r, font, row_scale, row_thick)[0][0]
+            for r in row_strs
+        ]
+        heights = [
+            cv2.getTextSize(r, font, row_scale, row_thick)[0][1]
+            for r in row_strs
+        ]
+        row_h = max(heights) if heights else th
+        content_w = max([tw] + widths)
+        panel_w = pad_x * 2 + bar_w + 6 + content_w
+        panel_h = pad_y * 2 + th + row_gap + len(rows) * (row_h + row_gap) - row_gap
+
+        # Anchor bottom-left of the broadcast frame.
+        fh, fw = frame.shape[:2]
+        x0 = 8
+        y0 = fh - panel_h - 8
+        x1 = x0 + panel_w
+        y1 = y0 + panel_h
+
+        # Semi-transparent dark background.
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, dst=frame)
+        cv2.rectangle(frame, (x0, y0), (x1, y1), (200, 200, 200), 1)
+
+        # Title.
+        cv2.putText(
+            frame, title,
+            (x0 + pad_x, y0 + pad_y + th),
+            font, title_scale, (220, 220, 220), title_thick, cv2.LINE_AA,
+        )
+
+        # Rows.
+        cursor_y = y0 + pad_y + th + row_gap
+        for s, text in zip(rows, row_strs):
+            color = self._TEAM_BGR.get(s.team_id, self._TEAM_BGR[-1])
+            row_top = cursor_y
+            row_bot = cursor_y + row_h
+            cv2.rectangle(
+                frame, (x0 + pad_x, row_top), (x0 + pad_x + bar_w, row_bot),
+                color, -1,
+            )
+            cv2.putText(
+                frame, text,
+                (x0 + pad_x + bar_w + 6, row_bot - 2),
+                font, row_scale, (240, 240, 240), row_thick, cv2.LINE_AA,
+            )
+            cursor_y = row_bot + row_gap
+
+    @staticmethod
+    def _player_label(
+        stats: PlayerStats,
+        identity: Optional[PlayerIdentityRegistry],
+    ) -> str:
+        """Render label for a player row. Prefers jersey number from the
+        registry; falls back to the persistent player_id when we don't
+        have the registry handy (e.g. tests).
+        """
+        if identity is not None:
+            p = identity.get(stats.player_id)
+            if p is not None:
+                return f"#{p.jersey_number}"
+        return f"P{stats.player_id}"
 
     def _draw_scoreboard(
         self,
@@ -580,6 +696,8 @@ class CompositeRenderer:
         current_frame: int = 0,
         scoreboard: Optional[Scoreboard] = None,
         team_labels: Optional[Dict[int, str]] = None,
+        player_stats: Optional[PlayerStatsAggregator] = None,
+        identity: Optional[PlayerIdentityRegistry] = None,
     ) -> np.ndarray:
         annotated = self.overlay.render(
             frame, sv_detections, mapped_players,
@@ -589,6 +707,8 @@ class CompositeRenderer:
             current_frame=current_frame,
             scoreboard=scoreboard,
             team_labels=team_labels,
+            player_stats=player_stats,
+            identity=identity,
         )
 
         right_panel = self._render_right_panel(
