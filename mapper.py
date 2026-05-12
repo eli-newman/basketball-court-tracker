@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from config import Config
-from detector import PlayerDetection
+from detector import BallDetection, PlayerDetection
 from homography import CourtKeypoint, HomographyEngine
 
 
@@ -29,6 +29,26 @@ class MappedPlayer:
     team_id: int = -1     # -1 = unknown, 0 = team A, 1 = team B, 2 = referee
     jersey_number: Optional[str] = None  # "0".."99" when locked by JerseyVoter
     jersey_locked: bool = False          # True after the vote threshold
+    has_ball: bool = False                # True when this player is the
+                                          # confirmed possessor for the frame
+
+
+@dataclass
+class MappedBall:
+    """Ball with both pixel and court coordinate positions.
+
+    Court coordinates are accurate when the ball is at floor level (loose
+    on the court, in a player's hands at hip height). When airborne mid-
+    shot/pass, the projected position is biased toward the camera — the
+    homography assumes the projected point lies on the floor plane.
+    """
+    court_x: float
+    court_y: float
+    pixel_x: float
+    pixel_y: float
+    bbox: tuple
+    confidence: float
+    possessor_track_id: Optional[int] = None  # track_id of confirmed holder, or None
 
 
 class CourtMapper:
@@ -107,6 +127,39 @@ class CourtMapper:
         xs = [p[0] for p in history]
         ys = [p[1] for p in history]
         return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+    def map_ball(
+        self,
+        ball: Optional[BallDetection],
+    ) -> Optional[MappedBall]:
+        """Map a ball detection to court coordinates using the latest H.
+
+        Caller is expected to call this AFTER map_frame() so the engine has
+        a valid (possibly cached) homography. Returns None when there's no
+        ball OR no homography to project with.
+
+        Uses the ball's bottom_center because that's least biased when the
+        ball is on the floor or near a player's hands. See MappedBall
+        docstring for the airborne-ball caveat.
+        """
+        if ball is None:
+            return None
+        H = self.engine.last_homography
+        if H is None:
+            return None
+        court_pos = self.engine.transform_point(
+            H, ball.bottom_center[0], ball.bottom_center[1],
+        )
+        if court_pos is None:
+            return None
+        return MappedBall(
+            court_x=court_pos[0],
+            court_y=court_pos[1],
+            pixel_x=ball.center[0],
+            pixel_y=ball.center[1],
+            bbox=ball.bbox,
+            confidence=ball.confidence,
+        )
 
     def cleanup_stale_tracks(self, active_track_ids: set):
         """Remove position history for tracks that are no longer active."""

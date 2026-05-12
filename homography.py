@@ -132,6 +132,18 @@ class HomographyEngine:
     def has_valid_homography(self) -> bool:
         return self._last_good_H is not None
 
+    @property
+    def last_homography(self) -> Optional[np.ndarray]:
+        """The most recent good H, or None if we never had one.
+
+        Use this when you need to project a second point after the main
+        compute() call (e.g., projecting the ball position right after
+        projecting all players). Returns the cached H even when the
+        current frame had no detectable keypoints, so the fallback window
+        also applies.
+        """
+        return self._last_good_H
+
     def _fallback(self) -> Optional[np.ndarray]:
         """Return cached homography if within fallback window."""
         self._frames_since_good += 1
