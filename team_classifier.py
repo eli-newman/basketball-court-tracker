@@ -146,12 +146,15 @@ class TeamClassifier:
         if x2 <= x1 or y2 <= y1:
             return None
 
-        # Chest ROI: 20-45% vertical (below chin, above waistband),
-        # center 50% horizontal (skip sleeves).
+        # Number ROI: 30-58% vertical (where the JERSEY NUMBER sits — that's
+        # the largest patch of true team color), center 50% horizontal.
+        # Was 20-45% before; that landed on the upper chest, ABOVE the number,
+        # so we were sampling mostly white for both teams in a white-on-white
+        # matchup.
         bh = y2 - y1
         bw = x2 - x1
-        cy1 = y1 + int(bh * 0.20)
-        cy2 = y1 + int(bh * 0.45)
+        cy1 = y1 + int(bh * 0.30)
+        cy2 = y1 + int(bh * 0.58)
         cx1 = x1 + int(bw * 0.25)
         cx2 = x2 - int(bw * 0.25)
         if cy2 <= cy1 or cx2 <= cx1:
@@ -165,17 +168,17 @@ class TeamClassifier:
         s = hsv[:, :, 1]
         v = hsv[:, :, 2]
 
-        # Saturated, mid-brightness pixels only — team accent, not white trim.
+        # Strict saturation gate (S≥100) — only TRUE accent-colored pixels.
+        # White/gray jersey body (S near 0) is excluded; only number / trim
+        # pixels survive. This is the only way to separate teams whose
+        # jersey bodies are both mostly white.
         mask = (s >= self._min_saturation) & (v > 50) & (v < 240)
 
-        # Occlusion mask: any pixel inside another player's bbox is excluded.
-        # This is the main fix for "defender's color leaks into offensive
-        # player's chest sample because their bboxes overlap."
+        # Occlusion mask: drop pixels inside any other player's bbox.
         if other_bboxes:
             H, W = crop.shape[:2]
             occlusion = np.ones((H, W), dtype=bool)
             for ox1, oy1, ox2, oy2 in other_bboxes:
-                # Intersect other bbox with our crop region (in crop-local coords).
                 ix1 = max(0, int(ox1) - cx1)
                 iy1 = max(0, int(oy1) - cy1)
                 ix2 = min(W, int(ox2) - cx1)
@@ -185,16 +188,27 @@ class TeamClassifier:
             mask = mask & occlusion
 
         if mask.sum() < 10:
-            # Fall back to saturation-only mask (lose occlusion guard, but
-            # better than zero pixels — usually means heavy overlap).
-            fallback = (s >= self._min_saturation) & (v > 50) & (v < 240)
-            if fallback.sum() < 10:
+            # Try a wider region (full chest) with the same strict S gate.
+            wider = frame[max(0, y1 + int(bh * 0.15)):max(0, y1 + int(bh * 0.65)),
+                          x1:x2]
+            if wider.size == 0:
                 return None
-            pixels = hsv[fallback]
+            hsv2 = cv2.cvtColor(wider, cv2.COLOR_BGR2HSV)
+            s2 = hsv2[:, :, 1]
+            v2 = hsv2[:, :, 2]
+            mask2 = (s2 >= self._min_saturation) & (v2 > 50) & (v2 < 240)
+            if mask2.sum() < 10:
+                return None
+            hue_pixels = hsv2[mask2, 0]
         else:
-            pixels = hsv[mask]
+            hue_pixels = hsv[mask, 0]
 
-        return np.median(pixels, axis=0).astype(np.float32)
+        # Cluster on HUE only (circular). OpenCV hue is 0-180; map to angle
+        # then take mean of unit vectors (handles the 180/0 wrap).
+        angles = hue_pixels.astype(np.float32) * (np.pi / 90.0)  # 0..180 → 0..2π
+        sin_h = float(np.mean(np.sin(angles)))
+        cos_h = float(np.mean(np.cos(angles)))
+        return np.array([sin_h, cos_h], dtype=np.float32)
 
     def _refit(self):
         """Recluster tracks: one median sample per track, fit, assign."""
@@ -221,12 +235,18 @@ class TeamClassifier:
         }
         self._calibrated = True
 
-        # Debug log
+        # Debug log — cluster centers are (sin h, cos h); reverse to hue degrees
         centers = kmeans.cluster_centers_
-        for i, center in enumerate(centers):
+        for i, (sin_h, cos_h) in enumerate(centers):
             count = sum(1 for v in self._track_assignments.values() if v == i)
-            h, s, v = center
-            print(f"  Team {i}: HSV=({h:.0f}, {s:.0f}, {v:.0f})  [{count} tracks]")
+            angle = np.degrees(np.arctan2(sin_h, cos_h))
+            if angle < 0:
+                angle += 360
+            hue_deg = angle / 2.0  # back to OpenCV's 0..180
+            print(
+                f"  Team {i}: hue≈{hue_deg:.0f}° (sinH={sin_h:.2f}, "
+                f"cosH={cos_h:.2f})  [{count} tracks]"
+            )
 
     def refit(self):
         """Public force-refit (e.g., after a detected scene change)."""
@@ -239,12 +259,20 @@ class TeamClassifier:
 
     @property
     def team_colors_bgr(self) -> List[Tuple[int, int, int]]:
-        """Cluster centers in BGR for visualization."""
+        """Cluster centers in BGR for visualization.
+
+        Cluster centers are (sin h, cos h); we recover hue degrees, set
+        saturation and value to fixed mid-high values for visibility.
+        """
         if not self._calibrated or self._kmeans is None:
             return [(200, 200, 200)] * self.n_teams
         out: List[Tuple[int, int, int]] = []
-        for center in self._kmeans.cluster_centers_:
-            hsv_pixel = np.uint8([[center]])
+        for sin_h, cos_h in self._kmeans.cluster_centers_:
+            angle = np.degrees(np.arctan2(sin_h, cos_h))
+            if angle < 0:
+                angle += 360
+            hue = int(angle / 2.0)  # OpenCV hue is 0-180
+            hsv_pixel = np.uint8([[[hue, 220, 220]]])
             bgr = cv2.cvtColor(hsv_pixel, cv2.COLOR_HSV2BGR)
             out.append((int(bgr[0, 0, 0]), int(bgr[0, 0, 1]), int(bgr[0, 0, 2])))
         return out
