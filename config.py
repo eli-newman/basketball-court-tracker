@@ -95,6 +95,17 @@ class Config:
     # gaps without holding stale possession across plays.
     possession_release_after_missing: int = 8
 
+    # Shot/event detection (uses action classes the model already returns).
+    # shot_window: rolling per-track buffer of action labels (frames).
+    # shot_confirm_at: how many of the last shot_window frames must show a
+    #   shot action for the shot to be confirmed. Drops single-frame noise.
+    # made_window_frames: after a shot's last frame, look this many frames
+    #   ahead for a ball-in-basket observation to call it made. 18 ≈ 0.6s
+    #   at 30 fps — about how long the ball takes to drop through.
+    shot_window: int = 6
+    shot_confirm_at: int = 3
+    made_window_frames: int = 18
+
     # Team classification
     n_teams: int = 2  # 2 = just teams, 3 = teams + referees
     # When both team names are set, the classifier uses canonical NBA color

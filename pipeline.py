@@ -17,6 +17,7 @@ from detector import PlayerDetector, CourtKeypointDetector
 from tracker import PlayerTracker
 from mapper import CourtMapper, MappedBall, MappedPlayer
 from possession import PossessionTracker
+from events import EventDetector, ShotEvent
 from team_classifier import TeamClassifier, resolve_team_profile
 from jersey import (
     JerseyNumberRecognizer, JerseyRead, JerseyVoter,
@@ -45,6 +46,11 @@ class Pipeline:
             max_distance_px=config.possession_max_distance_px,
             confirm_at=config.possession_confirm_at,
             release_after_missing=config.possession_release_after_missing,
+        )
+        self.events = EventDetector(
+            shot_window=config.shot_window,
+            shot_confirm_at=config.shot_confirm_at,
+            made_window_frames=config.made_window_frames,
         )
         self.half_selector = ActiveHalfSelector(
             history_frames=config.half_hysteresis_frames,
@@ -152,12 +158,12 @@ class Pipeline:
 
                 # 1+2. Run court keypoint and player detection in parallel
                 # (both are I/O-bound HTTP calls to Roboflow ~1s each). The
-                # player call also returns the ball in the same response —
-                # free, since it's the same model.
+                # player call also returns ball + action observations from
+                # the same response — free, since it's the same model.
                 keypoints_fut = self._detector_pool.submit(self.court_detector.detect, frame)
-                players_fut = self._detector_pool.submit(self.player_detector.detect_with_ball, frame)
+                players_fut = self._detector_pool.submit(self.player_detector.detect_all, frame)
                 keypoints = keypoints_fut.result()
-                raw_players, ball = players_fut.result()
+                raw_players, ball, actions = players_fut.result()
 
                 # 3. Track players (assign persistent IDs first — the team
                 #    classifier aggregates per track_id, so it needs them).
@@ -199,6 +205,15 @@ class Pipeline:
                 if mapped_ball is not None:
                     mapped_ball.possessor_track_id = possession.possessor_track_id
 
+                # 6.35 Event detection: shot attempts + makes from action
+                #      classes the model returned this frame.
+                self.events.update(
+                    frame_idx=frame_count,
+                    actions=actions,
+                    tracked_players=tracked_players,
+                    mapped_players=mapped_players,
+                )
+
                 # 6.4 Jersey OCR on unlocked tracks (every Nth frame per track)
                 if self.jersey_recognizer is not None:
                     self._update_jersey_numbers(frame, mapped_players, frame_count)
@@ -216,6 +231,8 @@ class Pipeline:
                     keypoints=keypoints if self.config.debug else None,
                     ball=ball,
                     mapped_ball=mapped_ball,
+                    shot_events=self.events.events,
+                    current_frame=frame_count,
                 )
 
                 # 8. Write frame
@@ -251,15 +268,46 @@ class Pipeline:
         self._save_json(all_frame_data, json_out)
         self._save_csv(all_frame_data, csv_out)
 
+        # Save shot/event log
+        events_out = os.path.join(self.config.output_dir, "output_events.json")
+        self._save_events(self.events.events, events_out)
+
         # Print summary
+        n_events = len(self.events.events)
+        made = sum(1 for e in self.events.events if e.made)
         print()
         print("=" * 60)
         print(f"Done! Processed {processed} frames in {elapsed:.1f}s ({processed / elapsed:.1f} fps)")
         print(f"Homography valid: {valid_homography_count}/{processed} frames ({valid_homography_count / max(processed, 1) * 100:.0f}%)")
-        print(f"Output video: {video_out}")
-        print(f"Output JSON:  {json_out}")
-        print(f"Output CSV:   {csv_out}")
+        print(f"Shot events: {n_events} ({made} made, {n_events - made} missed)")
+        print(f"Output video:  {video_out}")
+        print(f"Output JSON:   {json_out}")
+        print(f"Output CSV:    {csv_out}")
+        print(f"Output events: {events_out}")
         print("=" * 60)
+
+    def _save_events(self, events: List[ShotEvent], path: str):
+        """Persist the shot-event log as JSON. One entry per attempt."""
+        payload = [
+            {
+                "shooter_track_id": e.shooter_track_id,
+                "team_id": e.team_id,
+                "shot_type": e.shot_type,
+                "made": e.made,
+                "frame_start": e.frame_start,
+                "frame_end": e.frame_end,
+                "court_x": (
+                    round(e.court_x, 2) if e.court_x is not None else None
+                ),
+                "court_y": (
+                    round(e.court_y, 2) if e.court_y is not None else None
+                ),
+                "block_track_id": e.block_track_id,
+            }
+            for e in events
+        ]
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
 
     def _update_jersey_numbers(
         self,

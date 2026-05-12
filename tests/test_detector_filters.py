@@ -163,3 +163,53 @@ def test_legacy_detect_method_still_works():
         out = det.detect(np.zeros((720, 1280, 3), dtype=np.uint8))
     assert len(out) == 1
     assert out[0].class_name == "player"
+
+
+# ── Action class extraction ─────────────────────────────────────────────────
+
+
+def test_detect_all_returns_action_observations():
+    """detect_all surfaces jump-shot / basket / rim observations."""
+    det = PlayerDetector(_cfg())
+    preds = _fake_response(
+        _pred(),                                                  # player
+        _pred(cls="ball", x=400, y=200, w=20, h=20),              # ball
+        _pred(cls="player-jump-shot", x=500, y=300, w=80, h=200),
+        _pred(cls="ball-in-basket", x=600, y=100, w=30, h=30),
+        _pred(cls="rim", x=600, y=100, w=50, h=20),
+    )
+    with patch.object(det, "_call_api", return_value=preds):
+        players, ball, actions = det.detect_all(
+            np.zeros((720, 1280, 3), dtype=np.uint8),
+        )
+    assert len(players) == 1
+    assert ball is not None
+    assert len(actions) == 3
+    classes = {a.class_name for a in actions}
+    assert classes == {"player-jump-shot", "ball-in-basket", "rim"}
+
+
+def test_detect_all_drops_unknown_classes():
+    """`number`, `referee`, etc. don't appear in actions."""
+    det = PlayerDetector(_cfg())
+    preds = _fake_response(
+        _pred(cls="number"),
+        _pred(cls="referee"),
+        _pred(cls="player-jump-shot", x=500, y=300, w=80, h=200),
+    )
+    with patch.object(det, "_call_api", return_value=preds):
+        _, _, actions = det.detect_all(np.zeros((720, 1280, 3), dtype=np.uint8))
+    assert len(actions) == 1
+    assert actions[0].class_name == "player-jump-shot"
+
+
+def test_detect_all_api_failure_returns_empty_triple():
+    """API failure yields ([], None, []) — never crashes."""
+    det = PlayerDetector(_cfg())
+    with patch.object(det, "_call_api", return_value=None):
+        players, ball, actions = det.detect_all(
+            np.zeros((720, 1280, 3), dtype=np.uint8),
+        )
+    assert players == []
+    assert ball is None
+    assert actions == []
