@@ -38,9 +38,13 @@ class PlayerTracker:
         xyxy = np.array([d.bbox for d in detections], dtype=np.float32)
         confidence = np.array([d.confidence for d in detections], dtype=np.float32)
 
-        sv_dets = sv.Detections(
-            xyxy=xyxy,
-            confidence=confidence,
+        sv_dets = sv.Detections(xyxy=xyxy, confidence=confidence)
+
+        # Class-agnostic NMS: drop duplicate / heavily overlapping boxes
+        # (the upstream model's NMS occasionally misses exact duplicates).
+        sv_dets = sv_dets.with_nms(
+            threshold=self.config.nms_iou_threshold,
+            class_agnostic=True,
         )
 
         # Run ByteTrack
@@ -55,7 +59,7 @@ class PlayerTracker:
             track_id = int(tracked.tracker_id[i]) if tracked.tracker_id is not None else -1
             conf = float(tracked.confidence[i]) if tracked.confidence is not None else 0.0
 
-            # Find the original detection to get class_name
+            # Find the original detection to recover class_name
             class_name = "player"
             cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
             for d in detections:
@@ -70,6 +74,7 @@ class PlayerTracker:
                 center=(cx, cy),
                 confidence=conf,
                 class_name=class_name,
+                track_id=track_id,
             ))
 
         return tracked_players

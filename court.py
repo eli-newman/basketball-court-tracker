@@ -134,12 +134,56 @@ def court_to_minimap(
     minimap_h: int,
     padding: int = 10,
 ) -> Tuple[int, int]:
-    """Convert court coordinates (feet) to minimap pixel coordinates."""
+    """Convert court coordinates (feet) to full-court minimap pixel coordinates."""
     draw_w = minimap_w - 2 * padding
     draw_h = minimap_h - 2 * padding
     px = int(padding + (x_ft / COURT_LENGTH) * draw_w)
     py = int(padding + (y_ft / COURT_WIDTH) * draw_h)
     return (px, py)
+
+
+def court_to_minimap_half(
+    x_ft: float,
+    y_ft: float,
+    side: str,
+    minimap_w: int,
+    minimap_h: int,
+    padding: int = 10,
+) -> Tuple[int, int]:
+    """Convert court coordinates to a HALF-court minimap.
+
+    The active half (left = baselines x∈[0,47], right = x∈[47,94]) fills the
+    canvas, doubling the on-screen scale compared to a full-court render.
+    Orientation is preserved: when side="right", baseline-94 is on the right
+    of the canvas and the half-court line is on the left.
+
+    Coordinates outside the active half are still mapped — callers should
+    decide whether to draw them (clamped) or skip them.
+    """
+    draw_w = minimap_w - 2 * padding
+    draw_h = minimap_h - 2 * padding
+    half_length = COURT_LENGTH / 2  # 47ft
+
+    if side == "left":
+        x_norm = x_ft / half_length
+    elif side == "right":
+        x_norm = (x_ft - half_length) / half_length
+    else:
+        raise ValueError(f"side must be 'left' or 'right', got {side!r}")
+
+    px = int(padding + x_norm * draw_w)
+    py = int(padding + (y_ft / COURT_WIDTH) * draw_h)
+    return (px, py)
+
+
+def is_on_half(x_ft: float, side: str) -> bool:
+    """Return True if a court x-coordinate is on the named half."""
+    half_length = COURT_LENGTH / 2
+    if side == "left":
+        return x_ft <= half_length
+    if side == "right":
+        return x_ft >= half_length
+    raise ValueError(f"side must be 'left' or 'right', got {side!r}")
 
 
 def minimap_scale(minimap_w: int, minimap_h: int, padding: int = 10) -> Tuple[float, float]:
