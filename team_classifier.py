@@ -187,28 +187,48 @@ class TeamClassifier:
                     occlusion[iy1:iy2, ix1:ix2] = False
             mask = mask & occlusion
 
-        if mask.sum() < 10:
-            # Try a wider region (full chest) with the same strict S gate.
-            wider = frame[max(0, y1 + int(bh * 0.15)):max(0, y1 + int(bh * 0.65)),
-                          x1:x2]
-            if wider.size == 0:
-                return None
-            hsv2 = cv2.cvtColor(wider, cv2.COLOR_BGR2HSV)
-            s2 = hsv2[:, :, 1]
-            v2 = hsv2[:, :, 2]
-            mask2 = (s2 >= self._min_saturation) & (v2 > 50) & (v2 < 240)
-            if mask2.sum() < 10:
-                return None
-            hue_pixels = hsv2[mask2, 0]
-        else:
-            hue_pixels = hsv[mask, 0]
+        # ── Color-bucket proportions ────────────────────────────────────────
+        # Instead of trying to summarize each player with a single hue/V, we
+        # measure the **proportion** of chest pixels in each characteristic
+        # team-color bucket. NBA teams have a few canonical accent colors;
+        # different teams differ in WHICH BUCKETS they have non-zero
+        # proportions:
+        #
+        #   - ORANGE  H 10-25   (Knicks numbers/trim)
+        #   - RED     H 0-5 ∪ 170-180  (76ers, Bulls, Heat, Hawks)
+        #   - BLUE    H 100-130 (Knicks body, 76ers trim, Mavs, Pistons)
+        #   - GREEN   H 50-80   (Celtics, Bucks)
+        #   - PURPLE  H 130-150 (Lakers, Kings)
+        #   - YELLOW  H 25-35   (Pacers, Jazz, Lakers home)
+        #
+        # And we add **dark_body** — the fraction of pixels that are low-V
+        # (saturated dark colors like Knicks navy blue body). This is the
+        # one feature that uniquely separates teams in white from teams in
+        # dark colors regardless of accent.
+        h = hsv[:, :, 0]
+        sat_mask = (s >= self._min_saturation) & (v > 50) & (v < 240)
+        total_sat = int(sat_mask.sum()) + 1  # +1 to avoid /0
 
-        # Cluster on HUE only (circular). OpenCV hue is 0-180; map to angle
-        # then take mean of unit vectors (handles the 180/0 wrap).
-        angles = hue_pixels.astype(np.float32) * (np.pi / 90.0)  # 0..180 → 0..2π
-        sin_h = float(np.mean(np.sin(angles)))
-        cos_h = float(np.mean(np.cos(angles)))
-        return np.array([sin_h, cos_h], dtype=np.float32)
+        def frac(lo, hi):
+            return float(((h >= lo) & (h <= hi) & sat_mask).sum()) / total_sat
+
+        orange = frac(10, 25)
+        red_low = frac(0, 5)
+        red_high = frac(170, 180)
+        red = red_low + red_high
+        blue = frac(100, 130)
+        green = frac(50, 80)
+        purple = frac(130, 150)
+        yellow = frac(25, 35)
+
+        # dark_body: heavily-saturated dark pixels (jersey body of teams
+        # wearing dark colors). Knicks navy ≈ S>120, V<130.
+        dark_body = float(((s >= 120) & (v < 130)).sum()) / (s.size + 1)
+
+        return np.array(
+            [orange, red, blue, green, purple, yellow, dark_body],
+            dtype=np.float32,
+        )
 
     def _refit(self):
         """Recluster tracks: one median sample per track, fit, assign."""
@@ -235,18 +255,14 @@ class TeamClassifier:
         }
         self._calibrated = True
 
-        # Debug log — cluster centers are (sin h, cos h); reverse to hue degrees
+        # Debug log: show the strongest color signature in each cluster center
+        names = ["orange", "red", "blue", "green", "purple", "yellow", "dark_body"]
         centers = kmeans.cluster_centers_
-        for i, (sin_h, cos_h) in enumerate(centers):
+        for i, center in enumerate(centers):
             count = sum(1 for v in self._track_assignments.values() if v == i)
-            angle = np.degrees(np.arctan2(sin_h, cos_h))
-            if angle < 0:
-                angle += 360
-            hue_deg = angle / 2.0  # back to OpenCV's 0..180
-            print(
-                f"  Team {i}: hue≈{hue_deg:.0f}° (sinH={sin_h:.2f}, "
-                f"cosH={cos_h:.2f})  [{count} tracks]"
-            )
+            top = sorted(enumerate(center), key=lambda x: -x[1])[:3]
+            sig = " ".join(f"{names[j]}={frac:.2f}" for j, frac in top if frac > 0.02)
+            print(f"  Team {i}: {sig}  [{count} tracks]")
 
     def refit(self):
         """Public force-refit (e.g., after a detected scene change)."""
@@ -257,22 +273,24 @@ class TeamClassifier:
     def is_calibrated(self) -> bool:
         return self._calibrated
 
+    # Approx BGR for each color bucket (just for visualization)
+    _BUCKET_BGR = [
+        (0, 130, 255),    # orange (Knicks)
+        (40, 40, 220),    # red (76ers, Bulls, Heat)
+        (220, 100, 30),   # blue (Knicks body, Pistons, Mavs)
+        (40, 180, 40),    # green (Celtics, Bucks)
+        (200, 40, 160),   # purple (Lakers, Kings)
+        (0, 230, 230),    # yellow (Pacers, Lakers home)
+        (60, 30, 30),     # dark body (Knicks navy)
+    ]
+
     @property
     def team_colors_bgr(self) -> List[Tuple[int, int, int]]:
-        """Cluster centers in BGR for visualization.
-
-        Cluster centers are (sin h, cos h); we recover hue degrees, set
-        saturation and value to fixed mid-high values for visibility.
-        """
+        """Cluster centers as BGR — use the dominant color bucket per team."""
         if not self._calibrated or self._kmeans is None:
             return [(200, 200, 200)] * self.n_teams
         out: List[Tuple[int, int, int]] = []
-        for sin_h, cos_h in self._kmeans.cluster_centers_:
-            angle = np.degrees(np.arctan2(sin_h, cos_h))
-            if angle < 0:
-                angle += 360
-            hue = int(angle / 2.0)  # OpenCV hue is 0-180
-            hsv_pixel = np.uint8([[[hue, 220, 220]]])
-            bgr = cv2.cvtColor(hsv_pixel, cv2.COLOR_HSV2BGR)
-            out.append((int(bgr[0, 0, 0]), int(bgr[0, 0, 1]), int(bgr[0, 0, 2])))
+        for center in self._kmeans.cluster_centers_:
+            top_bucket = int(np.argmax(center))
+            out.append(self._BUCKET_BGR[top_bucket])
         return out

@@ -195,20 +195,24 @@ class HalfCourtMinimapRenderer:
 
 
 class OverlayRenderer:
-    """Draws bounding boxes and track IDs on the original video frame."""
+    """Draws bounding boxes and track IDs on the original video frame.
+
+    Box color reflects TEAM ASSIGNMENT (team 0 / team 1 / unknown), not the
+    track ID. This is the at-a-glance signal: same-color boxes = system
+    thinks those players are on the same team. Use this to debug team
+    classification visually.
+    """
+
+    # BGR colors for team_id 0, 1, 2, -1
+    _TEAM_BGR = {
+        0: (200, 100, 50),    # team 0 → blue-ish
+        1: (40, 40, 220),     # team 1 → red-ish
+        2: (0, 220, 220),     # team 2 (refs) → yellow
+        -1: (200, 200, 200),  # unknown → light gray
+    }
 
     def __init__(self, config: Config):
         self.config = config
-        self.box_annotator = sv.BoxAnnotator(
-            thickness=2,
-            color_lookup=sv.ColorLookup.TRACK,
-        )
-        self.label_annotator = sv.LabelAnnotator(
-            text_position=sv.Position.TOP_CENTER,
-            text_thickness=1,
-            text_scale=0.5,
-            color_lookup=sv.ColorLookup.TRACK,
-        )
 
     def render(
         self,
@@ -218,19 +222,28 @@ class OverlayRenderer:
         keypoints=None,
         debug: bool = False,
     ) -> np.ndarray:
-        """Draw detection overlays on the original frame."""
+        """Draw team-colored boxes + track ID labels."""
         annotated = frame.copy()
 
-        if sv_detections is not None and len(sv_detections) > 0:
-            # Build labels
-            labels = []
-            for i in range(len(sv_detections)):
-                tid = int(sv_detections.tracker_id[i]) if sv_detections.tracker_id is not None else -1
-                conf = float(sv_detections.confidence[i]) if sv_detections.confidence is not None else 0
-                labels.append(f"#{tid} {conf:.1%}")
-
-            annotated = self.box_annotator.annotate(annotated, sv_detections)
-            annotated = self.label_annotator.annotate(annotated, sv_detections, labels)
+        if mapped_players:
+            for p in mapped_players:
+                x1, y1, x2, y2 = [int(v) for v in p.bbox]
+                color = self._TEAM_BGR.get(p.team_id, self._TEAM_BGR[-1])
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+                label = f"#{p.track_id} T{p.team_id}"
+                if p.jersey_number is not None:
+                    label = f"#{p.jersey_number} T{p.team_id}"
+                (tw, th), _ = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1,
+                )
+                cv2.rectangle(
+                    annotated, (x1, y1 - th - 6), (x1 + tw + 4, y1),
+                    color, -1,
+                )
+                cv2.putText(
+                    annotated, label, (x1 + 2, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
+                )
 
         # Debug: draw detected court keypoints
         if debug and keypoints:
