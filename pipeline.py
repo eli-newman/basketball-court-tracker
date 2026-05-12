@@ -114,21 +114,28 @@ class Pipeline:
                 keypoints = keypoints_fut.result()
                 raw_players = players_fut.result()
 
-                # 3. Classify teams by jersey color
-                team_ids = self.team_classifier.classify(frame, raw_players)
-
-                # 4. Track players (assign persistent IDs)
+                # 3. Track players (assign persistent IDs first — the team
+                #    classifier aggregates per track_id, so it needs them).
                 tracked_players = self.tracker.update(raw_players)
+
+                # 4. Classify teams by jersey color (track-aware, occlusion-
+                #    masked). Returns team_id per tracked player in order.
+                team_ids = self.team_classifier.classify(frame, tracked_players)
+                for tp, tid in zip(tracked_players, team_ids):
+                    tp.class_name = tp.class_name  # noop — keep for clarity
+                team_by_track = {
+                    tp.track_id: t for tp, t in zip(tracked_players, team_ids)
+                }
 
                 # 5. Map to court coordinates
                 h_valid, mapped_players = self.mapper.map_frame(
                     keypoints, tracked_players
                 )
 
-                # 6. Assign team IDs to mapped players
-                #    Match by bbox proximity since tracker may reorder
-                if team_ids and team_ids[0] != -1:
-                    self._assign_team_ids(mapped_players, raw_players, team_ids)
+                # 6. Stamp team_id onto mapped players (looked up by track_id —
+                #    no more brittle bbox-proximity matching).
+                for mp in mapped_players:
+                    mp.team_id = team_by_track.get(mp.track_id, -1)
 
                 if h_valid:
                     valid_homography_count += 1
@@ -241,25 +248,6 @@ class Pipeline:
             if a is not None:
                 p.jersey_number = a.number
                 p.jersey_locked = a.locked
-
-    @staticmethod
-    def _assign_team_ids(
-        mapped_players: List[MappedPlayer],
-        raw_players,
-        team_ids: List[int],
-    ):
-        """Match team_ids from raw detections to mapped players by bbox proximity."""
-        for mp in mapped_players:
-            best_dist = float("inf")
-            best_team = -1
-            for raw, tid in zip(raw_players, team_ids):
-                dx = mp.pixel_x - raw.center[0]
-                dy = mp.pixel_y - raw.center[1]
-                dist = dx * dx + dy * dy
-                if dist < best_dist:
-                    best_dist = dist
-                    best_team = tid
-            mp.team_id = best_team
 
     def _build_frame_record(
         self,
