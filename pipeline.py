@@ -17,6 +17,10 @@ from detector import PlayerDetector, CourtKeypointDetector
 from tracker import PlayerTracker
 from mapper import CourtMapper, MappedPlayer
 from team_classifier import TeamClassifier
+from jersey import (
+    JerseyNumberRecognizer, JerseyRead, JerseyVoter,
+    crop_chest, parse_jersey_response,
+)
 from view_selector import ActiveHalfSelector
 from visualizer import CompositeRenderer
 
@@ -39,6 +43,17 @@ class Pipeline:
         self.half_selector = ActiveHalfSelector(
             history_frames=config.half_hysteresis_frames,
         )
+
+        # Jersey OCR (opt-in; expensive enough to be off by default)
+        self.jersey_recognizer: Optional[JerseyNumberRecognizer] = None
+        self.jersey_voter: Optional[JerseyVoter] = None
+        self._jersey_sample_offset: dict = {}  # track_id -> next sample frame
+        if config.enable_jersey_ocr:
+            self.jersey_recognizer = JerseyNumberRecognizer(config)
+            self.jersey_voter = JerseyVoter(
+                confirm_at=config.jersey_confirm_at,
+                min_confidence=config.jersey_min_confidence,
+            )
 
         # Video info (set in run())
         self.video_info = None
@@ -118,6 +133,10 @@ class Pipeline:
                 if h_valid:
                     valid_homography_count += 1
 
+                # 6.4 Jersey OCR on unlocked tracks (every Nth frame per track)
+                if self.jersey_recognizer is not None:
+                    self._update_jersey_numbers(frame, mapped_players, frame_count)
+
                 # 6.5 Pick active half from court keypoints (with hysteresis)
                 active_half = self.half_selector.update(keypoints)
 
@@ -172,6 +191,57 @@ class Pipeline:
         print(f"Output CSV:   {csv_out}")
         print("=" * 60)
 
+    def _update_jersey_numbers(
+        self,
+        frame: np.ndarray,
+        mapped_players: List[MappedPlayer],
+        frame_count: int,
+    ):
+        """OCR jersey numbers on tracks not yet locked, then stamp results."""
+        recognizer = self.jersey_recognizer
+        voter = self.jersey_voter
+        if recognizer is None or voter is None:
+            return
+
+        sample_every = max(1, self.config.jersey_sample_every)
+
+        # Sample unlocked tracks; reuse already-locked numbers without re-OCR
+        chest_crops = []
+        sampled_track_ids = []
+        for p in mapped_players:
+            existing = voter.current(p.track_id)
+            if existing and existing.locked:
+                continue  # already locked, skip OCR
+            next_sample = self._jersey_sample_offset.get(p.track_id, 0)
+            if frame_count < next_sample:
+                continue
+            crop = crop_chest(frame, p.bbox)
+            if crop.size == 0:
+                continue
+            chest_crops.append(crop)
+            sampled_track_ids.append(p.track_id)
+            self._jersey_sample_offset[p.track_id] = frame_count + sample_every
+
+        # OCR each sampled crop in parallel; submit votes
+        if chest_crops:
+            futures = [
+                self._detector_pool.submit(recognizer.read, c) for c in chest_crops
+            ]
+            for tid, fut in zip(sampled_track_ids, futures):
+                resp = fut.result()
+                read = parse_jersey_response(resp)
+                if read is None:
+                    continue
+                read.track_id = tid
+                voter.submit(read)
+
+        # Stamp every mapped player with whatever the voter currently has
+        for p in mapped_players:
+            a = voter.current(p.track_id)
+            if a is not None:
+                p.jersey_number = a.number
+                p.jersey_locked = a.locked
+
     @staticmethod
     def _assign_team_ids(
         mapped_players: List[MappedPlayer],
@@ -216,6 +286,8 @@ class Pipeline:
                     "confidence": round(p.confidence, 3),
                     "class_name": p.class_name,
                     "team_id": p.team_id,
+                    "jersey_number": p.jersey_number,
+                    "jersey_locked": p.jersey_locked,
                 }
                 for p in mapped_players
             ],

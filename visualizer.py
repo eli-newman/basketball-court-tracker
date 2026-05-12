@@ -77,11 +77,17 @@ class MinimapRenderer:
             cv2.circle(img, (px, py), 5, color, -1)
             cv2.circle(img, (px, py), 5, (255, 255, 255), 1)  # white outline
 
-            # Draw track ID label
-            label = str(player.track_id % 100)  # keep it short
+            # Draw jersey number if known, else short track ID
+            if player.jersey_number is not None:
+                label = f"#{player.jersey_number}"
+                # Bold if locked, normal if provisional
+                thickness = 2 if player.jersey_locked else 1
+            else:
+                label = str(player.track_id % 100)
+                thickness = 1
             cv2.putText(
                 img, label, (px + 7, py + 3),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), thickness,
             )
 
         return img
@@ -174,9 +180,15 @@ class HalfCourtMinimapRenderer:
 
             cv2.circle(img, (px, py), 7, color, -1)
             cv2.circle(img, (px, py), 7, (255, 255, 255), 1)
+            if player.jersey_number is not None:
+                label = f"#{player.jersey_number}"
+                thickness = 2 if player.jersey_locked else 1
+            else:
+                label = str(player.track_id % 100)
+                thickness = 1
             cv2.putText(
-                img, str(player.track_id % 100), (px + 9, py + 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1,
+                img, label, (px + 9, py + 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), thickness,
             )
 
         return img

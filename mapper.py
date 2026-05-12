@@ -27,6 +27,8 @@ class MappedPlayer:
     confidence: float
     class_name: str
     team_id: int = -1     # -1 = unknown, 0 = team A, 1 = team B, 2 = referee
+    jersey_number: Optional[str] = None  # "0".."99" when locked by JerseyVoter
+    jersey_locked: bool = False          # True after the vote threshold
 
 
 class CourtMapper:

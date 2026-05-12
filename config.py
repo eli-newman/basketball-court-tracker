@@ -26,7 +26,10 @@ class Config:
     # Player detection
     player_model_id: str = "basketball-player-detection-3-ycjdo/6"
     player_confidence: float = 0.4
-    nms_iou_threshold: float = 0.5  # de-dup overlapping boxes the model's NMS missed
+    # NMS only drops near-duplicate boxes (same player detected twice).
+    # 0.85 keeps stacked-player pairs (post-ups, screens, tight defense) where
+    # bboxes legitimately overlap 0.5-0.8. 0.5 was killing real defenders.
+    nms_iou_threshold: float = 0.85
     # Sanity filters applied at detection time (before tracking) so phantom
     # detections (people in the crowd, coaches on the sideline) don't pollute
     # the tracker's ID assignment.
@@ -36,6 +39,15 @@ class Config:
     # Court keypoint detection
     court_model_id: str = "basketball-court-detection-2/13"
     court_confidence: float = 0.3
+
+    # Jersey number OCR (opt-in — adds ~1 API call per tracked player per
+    # `jersey_sample_every` frames, so it costs real wall time).
+    enable_jersey_ocr: bool = False
+    jersey_model_id: str = "roboflow-jvuqo/basketball-jersey-numbers-ocr/7"
+    jersey_confidence: float = 0.4
+    jersey_sample_every: int = 5      # call OCR every Nth frame per track
+    jersey_confirm_at: int = 3        # votes needed to lock a number
+    jersey_min_confidence: float = 0.5  # discard reads below this
 
     # Homography
     min_keypoints: int = 4
@@ -113,6 +125,15 @@ class Config:
             help="Minimap layout: 'full' (full court only), 'half' (active "
                  "half only, auto-flipped), or 'both' (stacked). Default: both.",
         )
+        parser.add_argument(
+            "--jersey-ocr", action="store_true",
+            help="Enable jersey number OCR (adds API calls; persistent IDs "
+                 "across cuts; opt-in because it slows things down).",
+        )
+        parser.add_argument(
+            "--jersey-sample-every", type=int, default=5,
+            help="Run jersey OCR every Nth frame per unlocked track.",
+        )
 
         args = parser.parse_args()
         return cls(
@@ -132,6 +153,8 @@ class Config:
             inference_backend=args.backend,
             inference_host=args.inference_host,
             view=args.view,
+            enable_jersey_ocr=args.jersey_ocr,
+            jersey_sample_every=args.jersey_sample_every,
         )
 
     @classmethod
