@@ -189,6 +189,11 @@ class PlayerDetector:
     def __init__(self, config: Config):
         self.config = config
         self.api_url = f"{config.inference_host.rstrip('/')}/{config.player_model_id}"
+        # Per-class detection counter for `--detector-class-histogram`. Counts
+        # EVERY prediction the model returned, regardless of whether we kept
+        # it downstream — so we can see if action classes are appearing in
+        # the response at all on a given clip.
+        self._class_counts: Dict[str, int] = {}
 
     def detect(self, frame: np.ndarray) -> List[PlayerDetection]:
         """Detect players in a frame.
@@ -199,6 +204,23 @@ class PlayerDetector:
         """
         players, _ = self.detect_with_ball(frame)
         return players
+
+    def print_class_histogram(self):
+        """Print the cumulative class counter — useful for verifying whether
+        the model is returning action classes (`player-jump-shot`,
+        `ball-in-basket`, etc.) at all on a given clip. Zero counts mean
+        the model never emitted that class, NOT that our parsing is
+        filtering it out.
+        """
+        if not self._class_counts:
+            print("[detector] no predictions seen across the run")
+            return
+        total = sum(self._class_counts.values())
+        print(f"[detector] class histogram ({total} total predictions):")
+        for cls, n in sorted(
+            self._class_counts.items(), key=lambda kv: -kv[1]
+        ):
+            print(f"  {cls:<30}  {n:>6}  ({100 * n / total:.1f}%)")
 
     def detect_with_ball(
         self, frame: np.ndarray,
@@ -243,6 +265,9 @@ class PlayerDetector:
             conf = pred.get("confidence", 0.0)
             x1, y1 = x - w / 2, y - h / 2
             x2, y2 = x + w / 2, y + h / 2
+
+            # Tally every class the model returned, before any filtering.
+            self._class_counts[cls] = self._class_counts.get(cls, 0) + 1
 
             if cls in self._PLAYER_CLASSES:
                 # Sanity filter: drop boxes that don't look like a standing

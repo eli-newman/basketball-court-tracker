@@ -18,6 +18,7 @@ from tracker import PlayerTracker
 from mapper import CourtMapper, MappedBall, MappedPlayer
 from possession import PossessionTracker
 from events import EventDetector, ShotEvent
+from geo_shot import GeometricShotDetector
 from scoreboard import Scoreboard
 from team_classifier import TeamClassifier, resolve_team_profile
 from jersey import (
@@ -53,6 +54,14 @@ class Pipeline:
             shot_confirm_at=config.shot_confirm_at,
             made_window_frames=config.made_window_frames,
         )
+        # Geometric fallback: emits made-shot events when the ball passes
+        # through a rim bbox from above. Catches shots on model versions
+        # that don't emit the action classes EventDetector relies on.
+        self.geo_shot = GeometricShotDetector()
+        # Separate list for geometric shots so we can show them in the
+        # banner / scoreboard while keeping the action-class events list
+        # clean for inspection.
+        self._geo_events: List[ShotEvent] = []
         self.scoreboard = Scoreboard(n_teams=config.n_teams)
         self.half_selector = ActiveHalfSelector(
             history_frames=config.half_hysteresis_frames,
@@ -217,10 +226,25 @@ class Pipeline:
                     mapped_players=mapped_players,
                 )
 
-                # 6.37 Scoreboard: turn the (possibly newly extended) shot
-                #      event list into cumulative scores. Internal dedupe so
-                #      replaying the full list every frame is cheap.
-                self.scoreboard.update(self.events.events)
+                # 6.36 Geometric shot detection: catches makes that the
+                #      action-class detector misses (e.g. on models that
+                #      don't emit player-jump-shot / ball-in-basket).
+                new_geo = self.geo_shot.update(
+                    frame_idx=frame_count,
+                    ball=ball,
+                    actions=actions,
+                    mapped_players=mapped_players,
+                    possessor_track_id=possession.possessor_track_id,
+                )
+                if new_geo:
+                    self._geo_events.extend(new_geo)
+
+                # 6.37 Scoreboard: combined event list from BOTH detectors
+                #      (action-class + geometric). Scoreboard internally
+                #      dedupes by object identity, so we can rebuild the
+                #      list each frame without double-counting.
+                combined_events = self.events.events + self._geo_events
+                self.scoreboard.update(combined_events)
 
                 # 6.4 Jersey OCR on unlocked tracks (every Nth frame per track)
                 if self.jersey_recognizer is not None:
@@ -239,7 +263,7 @@ class Pipeline:
                     keypoints=keypoints if self.config.debug else None,
                     ball=ball,
                     mapped_ball=mapped_ball,
-                    shot_events=self.events.events,
+                    shot_events=combined_events,
                     current_frame=frame_count,
                     scoreboard=self.scoreboard,
                     team_labels=self._team_labels_map(),
@@ -278,15 +302,18 @@ class Pipeline:
         self._save_json(all_frame_data, json_out)
         self._save_csv(all_frame_data, csv_out)
 
-        # Save shot/event log + scoreboard
+        # Save shot/event log + scoreboard (combined: action-class + geo)
+        combined_events_final = self.events.events + self._geo_events
         events_out = os.path.join(self.config.output_dir, "output_events.json")
-        self._save_events(self.events.events, events_out)
+        self._save_events(combined_events_final, events_out)
         scoreboard_out = os.path.join(self.config.output_dir, "output_scoreboard.json")
         self._save_scoreboard(scoreboard_out)
 
         # Print summary
-        n_events = len(self.events.events)
-        made = sum(1 for e in self.events.events if e.made)
+        n_events = len(combined_events_final)
+        made = sum(1 for e in combined_events_final if e.made)
+        n_action = len(self.events.events)
+        n_geo = len(self._geo_events)
         score_state = self.scoreboard.state
         score_summary = " - ".join(
             f"{self._team_label(t)} {score_state.score_by_team.get(t, 0)}"
@@ -296,7 +323,8 @@ class Pipeline:
         print("=" * 60)
         print(f"Done! Processed {processed} frames in {elapsed:.1f}s ({processed / elapsed:.1f} fps)")
         print(f"Homography valid: {valid_homography_count}/{processed} frames ({valid_homography_count / max(processed, 1) * 100:.0f}%)")
-        print(f"Shot events: {n_events} ({made} made, {n_events - made} missed)")
+        print(f"Shot events: {n_events} ({made} made, {n_events - made} missed) "
+              f"[{n_action} from action classes, {n_geo} geometric]")
         print(f"Final score: {score_summary}")
         print(f"Output video:      {video_out}")
         print(f"Output JSON:       {json_out}")
@@ -304,6 +332,9 @@ class Pipeline:
         print(f"Output events:     {events_out}")
         print(f"Output scoreboard: {scoreboard_out}")
         print("=" * 60)
+        # Detector class histogram — surfaces "no action classes ever fired"
+        # bugs that otherwise look like "shot detection is broken."
+        self.player_detector.print_class_histogram()
 
     def _team_labels_map(self) -> dict:
         """Map of team_id → display label for each known team.
