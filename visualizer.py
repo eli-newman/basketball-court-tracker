@@ -394,11 +394,12 @@ class OverlayRenderer:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1,
                 )
 
-        # Scoreboard panel — top-right corner. Compact "KNI 14  SIX 12"
-        # rendered against a dark background so it's readable on any
-        # broadcast frame.
-        if scoreboard is not None:
-            self._draw_scoreboard(annotated, scoreboard, team_labels)
+        # NOTE: a scoreboard panel on the broadcast frame was tried and
+        # removed — broadcast video already burns in the real game
+        # scoreboard, so a system-drawn one was redundant overlay clutter.
+        # The Scoreboard class is still used: its state is saved to
+        # output_scoreboard.json for downstream analysis, and the SHOT
+        # MADE banner below pulls point values from it.
 
         # Recent-shot banner — flash MADE/MISSED across the top of the
         # frame for a short window after the event resolves. Picks the
