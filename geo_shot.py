@@ -6,22 +6,30 @@ Some model versions (including basketball-player-detection-3-ycjdo/6,
 which we use by default) DON'T emit those classes, so EventDetector
 never fires.
 
-This module fills the gap. It only needs:
-  - `ball` detections per frame (already in BallDetection)
-  - `rim` detections per frame (already in ActionObservation)
-  - The current possessor's track_id from PossessionTracker (so the
-    shot can be attributed)
+This module fills the gap using ball + rim geometry alone.
 
-A made shot is detected when the ball center enters a rim's bbox after
-having been ABOVE the rim in the recent past. That's the unambiguous
-"swish/through" signal — it can't fire on a ball merely passing by or
-sitting on the rim.
+State machine
+-------------
+A shot has two phases here:
 
-We deliberately don't try to detect MISSED shots here. The action-class
-detector handles those when they're available; doing it geometrically
-requires tracking the ball through a bounce arc and is brittle. Missed
-attempts are still implicitly logged via possession changes — a future
-extension can build a richer model.
+1. **Trigger**: the ball center enters a rim's bbox having been
+   *above* that rim in the recent past. This is when we start
+   tracking the outcome — but we don't emit yet.
+
+2. **Resolution**: over the next `resolution_frames` (≈0.5s at 30fps),
+   we watch the ball. There are exactly two outcomes that matter:
+     - The ball is observed BELOW the rim bbox → MADE. Through the
+       rim and through the net, the only way for the ball to end up
+       below the rim from above.
+     - The ball never goes below the rim within the window → MISSED.
+       Covers the front-rim brick, the back-iron bounce, the rim-roll
+       that comes back up. All of those leave the ball at or above
+       the rim, never below.
+
+The previous "any rim-bbox entry = made" was wrong because the rim
+bbox catches missed shots too — front-iron rejects, bounces, balls
+sitting on the rim. The "did it go BELOW" check is what
+distinguishes a make from anything else.
 """
 
 from collections import deque
@@ -33,19 +41,31 @@ from events import ShotEvent
 from mapper import MappedPlayer
 
 
-# Maximum frames between "ball above rim" and "ball through rim" for a
-# detection to fire. At 30fps, 30 frames ≈ 1s — covers the time from
-# release through net.
+# Maximum frames between "ball above rim" and "ball at rim" for the
+# trigger to count. At 30fps, 30 frames ≈ 1s — covers release through
+# rim contact.
 _MAX_SHOT_DURATION_FRAMES = 30
 
-# After firing a shot, suppress new emissions for this many frames so a
-# single basket doesn't trigger repeatedly as the ball continues through.
-_REFRACTORY_FRAMES = 20
+# After triggering a shot, watch this many frames for the
+# made-or-missed signal (ball seen below rim → made; otherwise missed).
+# 15 frames ≈ 0.5s — long enough for a made ball to drop through the
+# net and reappear below; short enough that we resolve before the next
+# play starts.
+_RESOLUTION_FRAMES = 15
+
+# After EMITTING a shot, suppress new triggers for this many frames so
+# a single basket doesn't repeatedly fire as the ball continues through.
+_REFRACTORY_FRAMES = 30
 
 # How many recent frames to look back when attributing a shot to a
 # possessor. The possession tracker may release the ball once it leaves
 # the shooter's hands, so we keep a memory of recent possessors.
 _POSSESSOR_LOOKBACK_FRAMES = 30
+
+# Pixel margin BELOW the rim bbox bottom that the ball must reach to be
+# called a make. Reduces sensitivity to rim-roll bounces that briefly
+# poke below the bbox without actually going through the net.
+_BELOW_RIM_MARGIN_PX = 4
 
 
 @dataclass
@@ -58,18 +78,40 @@ class _BallSample:
     above_any_rim: bool
 
 
+@dataclass
+class _PendingShot:
+    """A shot whose outcome (made/missed) we're still waiting to resolve."""
+    trigger_frame: int             # frame where ball entered a rim bbox
+    rim_bbox: Tuple[float, float, float, float]
+    shooter_track_id: Optional[int]
+    team_id: Optional[int]
+    court_pos: Optional[Tuple[float, float]]
+    saw_ball_below_rim: bool = False
+
+
 class GeometricShotDetector:
-    """Emits a ShotEvent when the ball passes through a rim from above."""
+    """Emits a ShotEvent (made OR missed) after watching ball + rim geometry.
+
+    A shot is *triggered* when the ball enters a rim bbox having been
+    above the rim recently. The shot is then *resolved* over the next
+    `resolution_frames`:
+      - if the ball is seen below the rim during that window → MADE
+      - otherwise → MISSED
+    """
 
     def __init__(
         self,
         max_shot_duration_frames: int = _MAX_SHOT_DURATION_FRAMES,
+        resolution_frames: int = _RESOLUTION_FRAMES,
         refractory_frames: int = _REFRACTORY_FRAMES,
         possessor_lookback_frames: int = _POSSESSOR_LOOKBACK_FRAMES,
+        below_rim_margin_px: float = _BELOW_RIM_MARGIN_PX,
     ):
         self.max_shot_duration_frames = max_shot_duration_frames
+        self.resolution_frames = resolution_frames
         self.refractory_frames = refractory_frames
         self.possessor_lookback_frames = possessor_lookback_frames
+        self.below_rim_margin_px = below_rim_margin_px
 
         self._ball_history: Deque[_BallSample] = deque(
             maxlen=max(max_shot_duration_frames, possessor_lookback_frames) + 5,
@@ -80,6 +122,10 @@ class GeometricShotDetector:
         )
         self._last_emit_frame: int = -10**9
         self._ball_was_inside_rim_last_frame: bool = False
+        # The currently-pending shot, if any. Only one at a time —
+        # there's no realistic scenario where two attempts overlap at
+        # the same rim.
+        self._pending: Optional[_PendingShot] = None
 
     def update(
         self,
@@ -89,94 +135,112 @@ class GeometricShotDetector:
         mapped_players: List[MappedPlayer],
         possessor_track_id: Optional[int],
     ) -> List[ShotEvent]:
-        """Advance one frame; return any ShotEvents that just resolved.
-
-        Args:
-            frame_idx: Absolute frame number.
-            ball: Current ball detection, or None.
-            actions: Detector's action observations this frame — we use
-                only the entries with class_name == "rim".
-            mapped_players: Used to look up the shooter's court position
-                + team_id at emission time.
-            possessor_track_id: Current confirmed possessor from the
-                PossessionTracker, or None.
-
-        Returns:
-            List of ShotEvents emitted this frame (usually empty; never
-            more than 1 per frame in practice).
-        """
+        """Advance one frame; return any ShotEvents that just resolved."""
         # Record possession for shooter attribution later.
         self._possessor_history.append((frame_idx, possessor_track_id))
 
-        if ball is None:
-            self._ball_was_inside_rim_last_frame = False
-            return []
-
         rims = [a for a in actions if a.class_name == "rim"]
-        if not rims:
-            self._ball_was_inside_rim_last_frame = False
-            return []
 
-        # Compute "ball above any rim" for the current sample. We define
-        # ABOVE as: ball_cy < rim_top - small_margin AND ball is roughly
-        # horizontally aligned with the rim. The horizontal check avoids
-        # counting a ball halfway down the court as "above" the rim.
-        bx, by = ball.center
-        above_any_rim = self._above_any_rim(bx, by, rims)
-        sample = _BallSample(
-            frame_idx=frame_idx, cx=bx, cy=by, above_any_rim=above_any_rim,
-        )
-        self._ball_history.append(sample)
+        # Track ball position (used both for triggering and for
+        # resolving an in-progress shot).
+        if ball is not None and rims:
+            bx, by = ball.center
+            above_any_rim = self._above_any_rim(bx, by, rims)
+            self._ball_history.append(_BallSample(
+                frame_idx=frame_idx, cx=bx, cy=by,
+                above_any_rim=above_any_rim,
+            ))
 
-        # Refractory: don't fire two events in quick succession.
-        if frame_idx - self._last_emit_frame < self.refractory_frames:
-            self._ball_was_inside_rim_last_frame = self._ball_inside_any_rim(
-                bx, by, rims,
+        # 1) If a shot is pending, check whether the ball just went
+        # BELOW its rim — that's the make signal. We do this even when
+        # the ball is None or no rim is in this frame; pending state
+        # persists until the resolution window expires.
+        emitted: List[ShotEvent] = []
+        if self._pending is not None and ball is not None:
+            _, _, _, rim_y2 = self._pending.rim_bbox
+            if ball.center[1] > rim_y2 + self.below_rim_margin_px:
+                self._pending.saw_ball_below_rim = True
+
+        # 2) Resolve the pending shot once its window has elapsed.
+        if self._pending is not None:
+            frames_elapsed = frame_idx - self._pending.trigger_frame
+            if frames_elapsed >= self.resolution_frames:
+                emitted.append(self._emit_pending(frame_idx))
+
+        # 3) Possibly trigger a new shot this frame.
+        # Refractory + an existing pending shot both block new triggers.
+        if (
+            ball is not None
+            and rims
+            and self._pending is None
+            and frame_idx - self._last_emit_frame >= self.refractory_frames
+        ):
+            bx, by = ball.center
+            inside_now = self._ball_inside_any_rim(bx, by, rims)
+            just_entered = (
+                inside_now and not self._ball_was_inside_rim_last_frame
             )
-            return []
+            self._ball_was_inside_rim_last_frame = inside_now
 
-        # Did the ball just enter a rim's bbox from outside?
-        inside_now = self._ball_inside_any_rim(bx, by, rims)
-        just_entered = inside_now and not self._ball_was_inside_rim_last_frame
-        self._ball_was_inside_rim_last_frame = inside_now
-        if not just_entered:
-            return []
+            if just_entered and self._was_above_rim_recently(frame_idx):
+                # Find the rim the ball is inside; record it for resolution.
+                rim_bbox = self._first_rim_containing(bx, by, rims)
+                shooter_id, team_id, court_pos = self._attribute_shot(
+                    mapped_players,
+                )
+                self._pending = _PendingShot(
+                    trigger_frame=frame_idx,
+                    rim_bbox=rim_bbox,
+                    shooter_track_id=shooter_id,
+                    team_id=team_id,
+                    court_pos=court_pos,
+                )
+        else:
+            # Keep this flag honest even when we couldn't trigger,
+            # so the "just_entered" edge detection works correctly
+            # on the next eligible frame.
+            if ball is not None and rims:
+                self._ball_was_inside_rim_last_frame = (
+                    self._ball_inside_any_rim(ball.center[0], ball.center[1], rims)
+                )
+            elif ball is None:
+                self._ball_was_inside_rim_last_frame = False
 
-        # Was the ball ABOVE some rim recently? Looking back within the
-        # max-shot-duration window keeps us honest — a ball bouncing
-        # around the floor for a long time shouldn't suddenly count
-        # because it crosses a rim bbox.
-        if not self._was_above_rim_recently(frame_idx):
-            return []
+        return emitted
 
-        # Resolve shooter from the recent-possessor history.
-        shooter_id, team_id, court_pos = self._attribute_shot(
-            mapped_players,
-        )
-
+    def _emit_pending(self, frame_idx: int) -> ShotEvent:
+        """Convert the pending shot into a ShotEvent and clear pending state."""
+        assert self._pending is not None
+        p = self._pending
+        made = p.saw_ball_below_rim
         event = ShotEvent(
-            shooter_track_id=shooter_id if shooter_id is not None else -1,
+            shooter_track_id=(
+                p.shooter_track_id if p.shooter_track_id is not None else -1
+            ),
             shot_type="geometric",
             frame_start=max(
-                frame_idx - self.max_shot_duration_frames, 0,
+                p.trigger_frame - self.max_shot_duration_frames, 0,
             ),
             frame_end=frame_idx,
-            made=True,
-            court_x=court_pos[0] if court_pos else None,
-            court_y=court_pos[1] if court_pos else None,
-            team_id=team_id if team_id is not None else -1,
+            made=made,
+            court_x=p.court_pos[0] if p.court_pos else None,
+            court_y=p.court_pos[1] if p.court_pos else None,
+            team_id=p.team_id if p.team_id is not None else -1,
         )
+        self._pending = None
         self._last_emit_frame = frame_idx
-        return [event]
+        return event
 
     def reset(self):
         """Forget recent ball/possessor history. Use on a camera cut —
         the previous shot's ball trajectory has nothing to do with the
-        new shot's geometry.
+        new shot's geometry. Pending shots are dropped (no resolution
+        signal across cut boundaries).
         """
         self._ball_history.clear()
         self._possessor_history.clear()
         self._ball_was_inside_rim_last_frame = False
+        self._pending = None
         # Don't reset _last_emit_frame — refractory is per-clip, not per-shot.
 
     # ── Helpers ─────────────────────────────────────────────────────────────
@@ -206,6 +270,21 @@ class GeometricShotDetector:
             if x1 <= bx <= x2 and y1 <= by <= y2:
                 return True
         return False
+
+    @staticmethod
+    def _first_rim_containing(
+        bx: float, by: float, rims: List[ActionObservation],
+    ) -> Tuple[float, float, float, float]:
+        """The first rim bbox containing the point. Caller guarantees one
+        exists (this helper is only called after _ball_inside_any_rim).
+        """
+        for r in rims:
+            x1, y1, x2, y2 = r.bbox
+            if x1 <= bx <= x2 and y1 <= by <= y2:
+                return (x1, y1, x2, y2)
+        # Fallback: should not be reached.
+        x1, y1, x2, y2 = rims[0].bbox
+        return (x1, y1, x2, y2)
 
     def _was_above_rim_recently(self, frame_idx: int) -> bool:
         cutoff = frame_idx - self.max_shot_duration_frames
