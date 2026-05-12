@@ -162,6 +162,13 @@ class MinimapRenderer:
         for tid in stale:
             del self._trails[tid]
 
+    def reset_trails(self):
+        """Clear ALL trails. Use on a camera cut so we don't draw lines
+        connecting a player's position in the previous shot to their
+        (possibly very different) position in the new shot.
+        """
+        self._trails.clear()
+
 
 class HalfCourtMinimapRenderer:
     """Renders just the active half of the court at 2x scale.
@@ -282,6 +289,10 @@ class HalfCourtMinimapRenderer:
             cv2.circle(img, (bx, by), 4, _BALL_BGR, -1)
 
         return img
+
+    def reset_trails(self):
+        """Clear all half-court trails. Use on a camera cut."""
+        self._trails.clear()
 
 
 class OverlayRenderer:
@@ -670,6 +681,15 @@ class CompositeRenderer:
     @property
     def output_height(self) -> int:
         return self._output_height
+
+    def reset_for_cut(self):
+        """Clear visualization state that shouldn't carry across a cut —
+        currently just the minimap trails (we don't want lines connecting
+        a player's last court position before a cut to their first
+        position after).
+        """
+        self.full.reset_trails()
+        self.half.reset_trails()
 
 
 def _resize_to_height(img: np.ndarray, h: int) -> np.ndarray:

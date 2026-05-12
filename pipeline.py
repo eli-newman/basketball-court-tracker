@@ -13,6 +13,7 @@ import numpy as np
 import supervision as sv
 
 from config import Config
+from cut_detector import CameraCutDetector
 from detector import PlayerDetector, CourtKeypointDetector
 from tracker import PlayerTracker
 from mapper import CourtMapper, MappedBall, MappedPlayer
@@ -63,6 +64,10 @@ class Pipeline:
         # clean for inspection.
         self._geo_events: List[ShotEvent] = []
         self.scoreboard = Scoreboard(n_teams=config.n_teams)
+        self.cut_detector = CameraCutDetector(
+            cut_threshold=config.cut_threshold,
+        )
+        self._cuts_seen: int = 0
         self.half_selector = ActiveHalfSelector(
             history_frames=config.half_hysteresis_frames,
         )
@@ -167,6 +172,24 @@ class Pipeline:
 
                 if self.config.max_frames > 0 and processed >= self.config.max_frames:
                     break
+
+                # 0. Camera cut detection FIRST. If this frame is the first
+                # of a new shot, wipe per-shot state (tracker, possession,
+                # in-progress shots, ball history, minimap trails,
+                # homography cache) so the new shot starts fresh and we
+                # don't try to match new players to stale track IDs.
+                if self.cut_detector.update(frame):
+                    self._cuts_seen += 1
+                    self.tracker.reset()
+                    self.possession.reset()
+                    self.events.reset_shot_progress()
+                    self.geo_shot.reset()
+                    self.mapper.engine.reset()
+                    self.renderer.reset_for_cut()
+                    print(
+                        f"[cut] frame {frame_count}: camera cut detected "
+                        f"(distance={self.cut_detector.last_distance:.2f})"
+                    )
 
                 # 1+2. Run court keypoint and player detection in parallel
                 # (both are I/O-bound HTTP calls to Roboflow ~1s each). The
@@ -323,6 +346,7 @@ class Pipeline:
         print("=" * 60)
         print(f"Done! Processed {processed} frames in {elapsed:.1f}s ({processed / elapsed:.1f} fps)")
         print(f"Homography valid: {valid_homography_count}/{processed} frames ({valid_homography_count / max(processed, 1) * 100:.0f}%)")
+        print(f"Camera cuts detected: {self._cuts_seen}")
         print(f"Shot events: {n_events} ({made} made, {n_events - made} missed) "
               f"[{n_action} from action classes, {n_geo} geometric]")
         print(f"Final score: {score_summary}")

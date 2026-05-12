@@ -82,3 +82,19 @@ class PlayerTracker:
     @property
     def last_sv_detections(self) -> Optional[sv.Detections]:
         return self._last_sv_detections
+
+    def reset(self):
+        """Drop all track state. Use on a camera cut so new players in the
+        next shot get fresh IDs instead of being matched against stale
+        tracks from the previous shot.
+
+        Reconstructs the underlying ByteTrack instance because supervision
+        exposes only `reset` on newer versions; instantiating fresh is
+        backward-compatible.
+        """
+        self.tracker = sv.ByteTrack(
+            track_activation_threshold=self.config.player_confidence,
+            minimum_matching_threshold=0.8,
+            frame_rate=30,
+        )
+        self._last_sv_detections = sv.Detections.empty()

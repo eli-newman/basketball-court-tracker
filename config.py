@@ -106,6 +106,12 @@ class Config:
     shot_confirm_at: int = 3
     made_window_frames: int = 18
 
+    # Camera cut detection: histogram Bhattacharyya distance threshold
+    # above which a hard cut is declared (then tracker, possession, and
+    # in-progress shots all reset). Empirically 0.45 sits cleanly between
+    # "lots of camera motion" (~0.25) and "different scene" (~0.55+).
+    cut_threshold: float = 0.45
+
     # Team classification
     n_teams: int = 2  # 2 = just teams, 3 = teams + referees
     # When set, every chest crop the classifier samples is saved as a PNG

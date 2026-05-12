@@ -165,6 +165,14 @@ class PossessionTracker:
     def current_possessor(self) -> Optional[int]:
         return self._current_possessor
 
+    def reset(self):
+        """Drop all possession state. Use on a camera cut — possession
+        from the previous shot doesn't transfer to a different scene.
+        """
+        self._candidates.clear()
+        self._current_possessor = None
+        self._missing_frames = 0
+
 
 def _bbox_to_point_distance(bbox: tuple, px: float, py: float) -> float:
     """Euclidean distance from point (px, py) to nearest edge of bbox.

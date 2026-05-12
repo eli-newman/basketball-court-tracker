@@ -169,6 +169,16 @@ class GeometricShotDetector:
         self._last_emit_frame = frame_idx
         return [event]
 
+    def reset(self):
+        """Forget recent ball/possessor history. Use on a camera cut —
+        the previous shot's ball trajectory has nothing to do with the
+        new shot's geometry.
+        """
+        self._ball_history.clear()
+        self._possessor_history.clear()
+        self._ball_was_inside_rim_last_frame = False
+        # Don't reset _last_emit_frame — refractory is per-clip, not per-shot.
+
     # ── Helpers ─────────────────────────────────────────────────────────────
 
     @staticmethod

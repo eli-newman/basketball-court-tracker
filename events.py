@@ -221,6 +221,18 @@ class EventDetector:
         """All emitted shot events so far, chronological."""
         return self._events
 
+    def reset_shot_progress(self):
+        """Drop in-progress / pending shot state. Use on a camera cut —
+        a shot in progress on the previous shot is no longer observable.
+        We DO keep the `events` list of already-emitted resolutions
+        because those were complete events, attributed to track IDs that
+        existed at the time.
+        """
+        self._track_history.clear()
+        self._open_shots.clear()
+        self._pending.clear()
+        self._idle_counters.clear()
+
     # ── Internals ───────────────────────────────────────────────────────────
 
     def _attribute_actions(
