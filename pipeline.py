@@ -185,6 +185,10 @@ class Pipeline:
                     self.events.reset_shot_progress()
                     self.geo_shot.reset()
                     self.mapper.engine.reset()
+                    # Team classifier: drop per-track sample buffers so
+                    # the next "track 4" doesn't inherit the previous
+                    # "track 4"'s color samples. Keeps fitted anchors.
+                    self.team_classifier.reset_track_state()
                     self.renderer.reset_for_cut()
                     print(
                         f"[cut] frame {frame_count}: camera cut detected "

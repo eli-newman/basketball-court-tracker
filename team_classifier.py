@@ -580,6 +580,21 @@ class TeamClassifier:
         self._refit()
         self._frames_since_refit = 0
 
+    def reset_track_state(self):
+        """Clear per-track sample buffers + assignments. Keeps the fitted
+        model (anchors or KMeans) so the next shot's tracks can be
+        classified immediately without re-warming.
+
+        Use on a camera cut: when the tracker resets its IDs, the next
+        new player gets an old track ID. Without this we'd average that
+        new player's chest-color samples with the previous player's,
+        producing a polluted median that drifts into unknown/wrong team.
+        """
+        self._track_samples.clear()
+        self._track_assignments.clear()
+        # Keep _kmeans, _team_anchors, _calibrated — the model is global
+        # to the clip, only per-track samples are per-shot.
+
     @property
     def is_calibrated(self) -> bool:
         return self._calibrated
