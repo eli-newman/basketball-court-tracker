@@ -212,6 +212,7 @@ class TeamClassifier:
         min_samples_to_classify: int = 3,
         team_anchors: Optional[Sequence[np.ndarray]] = None,
         team_names: Optional[Sequence[str]] = None,
+        debug_crop_dir: Optional[str] = None,
     ):
         """
         Args:
@@ -247,10 +248,17 @@ class TeamClassifier:
         self._refit_every = refit_every
         self._min_samples_to_classify = min_samples_to_classify
 
-        # Supervised mode state
+        # Supervised mode state. When anchors are present we don't need a
+        # warmup at all — the anchors are calibrated — so collapse the
+        # warmup + min-samples thresholds to 1. New tracks get classified
+        # the moment they're detected rather than sitting unclassified
+        # for 15+ frames.
         self._team_anchors: Optional[np.ndarray] = None
         self._team_names: Optional[List[str]] = None
         if team_anchors is not None:
+            self._warmup_frames = 1
+            self._min_samples_to_classify = 1
+            self._refit_every = 1
             anchors = np.stack([np.asarray(a, dtype=np.float32) for a in team_anchors], axis=0)
             if anchors.shape[0] != n_teams:
                 raise ValueError(
@@ -271,6 +279,15 @@ class TeamClassifier:
         # Bookkeeping
         self._frame_count = 0
         self._frames_since_refit = 0
+
+        # Debug: dump every chest crop we sample to disk. When set, each
+        # sampled ROI is written to `<dir>/track_<id>_<frame>.png` with the
+        # extracted feature in the filename. Lets us visually verify that
+        # the ROI is on the jersey body and not on the head/background.
+        self._debug_crop_dir: Optional[str] = debug_crop_dir
+        if debug_crop_dir:
+            import os as _os
+            _os.makedirs(debug_crop_dir, exist_ok=True)
 
     def classify(
         self,
@@ -390,11 +407,21 @@ class TeamClassifier:
         s = hsv[:, :, 1]
         v = hsv[:, :, 2]
 
-        # Skin mask: coarse skin-tone filter. Skin pixels sit in
-        # H ∈ [0, 25] with moderate S and high V. Dropping them stops a
-        # player's face from biasing the median when the bbox cropping
-        # is loose.
-        skin_mask = (h <= 25) & (s >= 30) & (s <= 170) & (v >= 100)
+        # Skin mask: coarse skin-tone filter covering light AND dark skin.
+        # Skin pixels in HSV: hue H in [0, 25] (red-orange wraparound) OR
+        # H in [170, 180] (red wraparound on the other side), with moderate
+        # saturation. Critically the V range is wide — dark skin in
+        # broadcast shadows reads as V≈50-90, the SAME range as a navy
+        # jersey, so without a wide V floor the skin mask misses dark
+        # faces entirely and the body-V median collapses to "navy" for
+        # whichever Sixers player got cropped with their head in frame.
+        # V ceiling is 200, NOT 255, so we don't accidentally mask out
+        # very-bright orange numbers (which sit at V≈200-230, S≈220+).
+        skin_mask = (
+            ((h <= 25) | (h >= 170))
+            & (s >= 20) & (s <= 200)
+            & (v >= 40) & (v <= 200)
+        )
 
         # Occlusion mask: drop pixels inside any other player's bbox.
         H, W = crop.shape[:2]
@@ -408,12 +435,19 @@ class TeamClassifier:
                 if ix2 > ix1 and iy2 > iy1:
                     occlusion[iy1:iy2, ix1:ix2] = False
 
-        # Valid body pixels: not skin, not occluded, not pure black
-        # (shadows) or pure white (rim lighting saturation).
+        # Valid body pixels: not skin, not occluded, not pure black or pure
+        # white (extreme shadows / rim-light saturation).
         body = (~skin_mask) & occlusion & (v >= 20) & (v <= 250)
 
-        if body.sum() < 20:
-            # Not enough body pixels to trust the median.
+        # Reject the whole sample if too much of the ROI is skin — that
+        # means the ROI mis-targeted the head/face and the remaining body
+        # pixels are tiny edge slivers that don't represent the jersey.
+        # Without this guard, samples like "75% face + 25% jersey
+        # background sliver" let dark-skin tones masquerade as navy body.
+        roi_area = H * W
+        if skin_mask.sum() > 0.5 * roi_area:
+            return None
+        if body.sum() < max(20, int(0.15 * roi_area)):
             return None
 
         body_v = float(np.median(v[body]))
@@ -433,10 +467,24 @@ class TeamClassifier:
             ((h >= 95) & (h <= 130) & sat).sum()
         ) / total_sat
 
-        return np.array(
+        feature = np.array(
             [body_v, body_s, accent_red, accent_blue],
             dtype=np.float32,
         )
+
+        # Debug: save the crop we just measured, with the feature in the
+        # filename, so we can verify visually what's being sampled.
+        if self._debug_crop_dir:
+            import os as _os
+            stem = (
+                f"track_{player.track_id:03d}_"
+                f"f{self._frame_count:04d}_"
+                f"V{int(body_v):03d}_S{int(body_s):03d}_"
+                f"r{int(accent_red * 100):02d}_b{int(accent_blue * 100):02d}.png"
+            )
+            cv2.imwrite(_os.path.join(self._debug_crop_dir, stem), crop)
+
+        return feature
 
     def _refit(self):
         """Recluster tracks: one median sample per track, fit, assign.

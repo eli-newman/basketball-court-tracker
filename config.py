@@ -108,6 +108,10 @@ class Config:
 
     # Team classification
     n_teams: int = 2  # 2 = just teams, 3 = teams + referees
+    # When set, every chest crop the classifier samples is saved as a PNG
+    # with V/S/accent values in the filename. Lets you visually verify the
+    # ROI lands on the jersey body — debug tool, not for production runs.
+    team_classifier_debug_crops: Optional[str] = None
     # When both team names are set, the classifier uses canonical NBA color
     # signatures (TEAM_PROFILES in team_classifier.py) and skips KMeans.
     # Recommended for any clip where you know the matchup — KMeans is brittle
@@ -180,6 +184,12 @@ class Config:
             help="Name of team 1 for supervised color classification "
                  "(e.g. 'sixers'). See --team-a.",
         )
+        parser.add_argument(
+            "--team-debug-crops", default=None,
+            help="Directory to dump every chest-crop the team classifier "
+                 "sampled, with V/S/accent values in each filename. Use to "
+                 "verify the ROI is on the jersey body.",
+        )
 
         args = parser.parse_args()
         return cls(
@@ -203,6 +213,7 @@ class Config:
             jersey_sample_every=args.jersey_sample_every,
             team_a=args.team_a,
             team_b=args.team_b,
+            team_classifier_debug_crops=args.team_debug_crops,
         )
 
     @classmethod

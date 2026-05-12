@@ -287,12 +287,17 @@ class OverlayRenderer:
     classification visually.
     """
 
-    # BGR colors for team_id 0, 1, 2, -1
+    # BGR colors for team_id 0, 1, 2, -1. Picked to be MAXIMALLY distinct
+    # so you can read team assignments at a glance — pure saturated blue
+    # vs pure saturated red vs bright magenta for unknown. Previously
+    # team-0 (200,100,50) and unknown (200,200,200) shared a high blue
+    # channel and looked similar on screen, which made T-1 boxes around
+    # unclassified players read as "team 0" to the eye.
     _TEAM_BGR = {
-        0: (200, 100, 50),    # team 0 → blue-ish
-        1: (40, 40, 220),     # team 1 → red-ish
-        2: (0, 220, 220),     # team 2 (refs) → yellow
-        -1: (200, 200, 200),  # unknown → light gray
+        0: (255, 0, 0),        # team 0 → pure blue
+        1: (0, 0, 255),        # team 1 → pure red
+        2: (0, 220, 220),      # team 2 (refs) → yellow
+        -1: (255, 0, 255),     # unknown → bright magenta (impossible to miss)
     }
 
     def __init__(self, config: Config):

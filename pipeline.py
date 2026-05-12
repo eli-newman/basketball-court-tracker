@@ -109,6 +109,7 @@ class Pipeline:
             n_teams=2,
             team_anchors=[anchor_a, anchor_b],
             team_names=[config.team_a, config.team_b],
+            debug_crop_dir=config.team_classifier_debug_crops,
         )
 
     def run(self):
