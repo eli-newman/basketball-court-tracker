@@ -128,8 +128,63 @@ class PlayerDetection:
     track_id: int = -1    # persistent ID from tracker; -1 = untracked
 
 
+@dataclass
+class BallDetection:
+    """A detected basketball.
+
+    Unlike PlayerDetection there's no `bottom_center` distinction because the
+    ball is small and often airborne — the bbox center is the most stable
+    reference point. `bottom_center` is still exposed because the pipeline
+    sometimes uses it to map onto the court (rough approximation when the
+    ball is mid-flight, fine when it's near a player's hands at hip level).
+    """
+    bbox: tuple           # (x1, y1, x2, y2)
+    center: tuple         # (cx, cy) — bbox center, the canonical ball position
+    bottom_center: tuple  # (x, y) — bottom of bbox; used for court mapping
+    confidence: float
+
+
+@dataclass
+class ActionObservation:
+    """A model action prediction (player-jump-shot, player-layup-dunk, etc.).
+
+    The Roboflow basketball-player-detection-3 model returns several action
+    classes alongside players and balls. Each action comes back as its own
+    bbox — typically tightly overlapping a player. We don't associate it
+    with a track at detection time; the pipeline does that downstream via
+    bbox IoU against tracked players.
+    """
+    bbox: tuple           # (x1, y1, x2, y2)
+    center: tuple         # (cx, cy)
+    class_name: str       # e.g. "player-jump-shot", "ball-in-basket"
+    confidence: float
+
+
+# Classes the detector exposes via `detect_all` in addition to players/ball.
+# Used both for shot-action observations and for the rim itself (used as a
+# geometric sanity check on `ball-in-basket` events later).
+_ACTION_CLASSES = {
+    "player-jump-shot",
+    "player-layup-dunk",
+    "player-shot-block",
+    "ball-in-basket",
+    "rim",
+}
+
+
 class PlayerDetector:
-    """Roboflow API basketball player detection."""
+    """Roboflow API basketball player detection.
+
+    The underlying model (basketball-player-detection-3) returns multiple
+    classes per frame — `player`, `player-in-possession`, `referee`, `ball`,
+    `rim`, `number`, plus several action classes. Historically this class
+    discarded everything but the player rows; we now expose a
+    `detect_with_ball` method that returns the ball detection from the same
+    inference call (no extra API cost).
+    """
+
+    # Bbox sanity filters apply to PLAYERS only — ball/rim are tiny by nature.
+    _PLAYER_CLASSES = {"player", "player-in-possession"}
 
     def __init__(self, config: Config):
         self.config = config
@@ -142,36 +197,88 @@ class PlayerDetector:
         Only `player` and `player-in-possession` classes are returned;
         `referee`, `rim`, `ball`, `number` are filtered out.
         """
+        players, _ = self.detect_with_ball(frame)
+        return players
+
+    def detect_with_ball(
+        self, frame: np.ndarray,
+    ) -> tuple[List[PlayerDetection], Optional[BallDetection]]:
+        """Detect players AND ball in one API call. Discards action classes.
+
+        See `detect_all` for the version that also returns shot-action
+        observations.
+        """
+        players, ball, _ = self.detect_all(frame)
+        return players, ball
+
+    def detect_all(
+        self, frame: np.ndarray,
+    ) -> tuple[List[PlayerDetection], Optional[BallDetection], List[ActionObservation]]:
+        """One inference call → players, ball, action observations.
+
+        The basketball-player-detection-3 model returns multiple classes per
+        frame. We bucket them into three streams:
+
+          - **Players** (`player`, `player-in-possession`): geometry-filtered
+            for sane standing-player shapes.
+          - **Ball**: highest-confidence kept if multiple.
+          - **Actions**: every non-player non-ball detection of interest for
+            event detection (`player-jump-shot`, `player-layup-dunk`,
+            `player-shot-block`, `ball-in-basket`, `rim`).
+
+        Everything else (`referee`, `number`, etc.) is dropped.
+        """
         result = self._call_api(frame, self.config.player_confidence)
         if result is None:
-            return []
+            return [], None, []
 
-        players = []
+        players: List[PlayerDetection] = []
+        ball_candidates: List[BallDetection] = []
+        actions: List[ActionObservation] = []
+
         for pred in result.get("predictions", []):
-            cls = pred.get("class", "player")
-            if cls not in ("player", "player-in-possession"):
-                continue
+            cls = pred.get("class", "")
             x, y = pred["x"], pred["y"]
             w, h = pred["width"], pred["height"]
-
-            # Sanity filter: drop boxes that don't look like a standing player.
-            # Crowd / sideline false positives are usually small or wide.
-            if h < self.config.min_player_bbox_height:
-                continue
-            if w > 0 and (h / w) < self.config.min_player_aspect_ratio:
-                continue
-
+            conf = pred.get("confidence", 0.0)
             x1, y1 = x - w / 2, y - h / 2
             x2, y2 = x + w / 2, y + h / 2
 
-            players.append(PlayerDetection(
-                bbox=(x1, y1, x2, y2),
-                bottom_center=(x, y2),  # bottom center = feet
-                center=(x, y),
-                confidence=pred.get("confidence", 0.0),
-                class_name=cls,
-            ))
-        return players
+            if cls in self._PLAYER_CLASSES:
+                # Sanity filter: drop boxes that don't look like a standing
+                # player. Crowd / sideline false positives are usually small
+                # or wide.
+                if h < self.config.min_player_bbox_height:
+                    continue
+                if w > 0 and (h / w) < self.config.min_player_aspect_ratio:
+                    continue
+                players.append(PlayerDetection(
+                    bbox=(x1, y1, x2, y2),
+                    bottom_center=(x, y2),  # bottom center = feet
+                    center=(x, y),
+                    confidence=conf,
+                    class_name=cls,
+                ))
+            elif cls == "ball":
+                # No sanity filter — ball is tiny by design. We do require
+                # the model's own confidence threshold (already applied
+                # server-side via `player_confidence`) but nothing more.
+                ball_candidates.append(BallDetection(
+                    bbox=(x1, y1, x2, y2),
+                    center=(x, y),
+                    bottom_center=(x, y2),
+                    confidence=conf,
+                ))
+            elif cls in _ACTION_CLASSES:
+                actions.append(ActionObservation(
+                    bbox=(x1, y1, x2, y2),
+                    center=(x, y),
+                    class_name=cls,
+                    confidence=conf,
+                ))
+
+        ball = max(ball_candidates, key=lambda b: b.confidence) if ball_candidates else None
+        return players, ball, actions
 
     def _call_api(self, frame: np.ndarray, confidence: float) -> Optional[dict]:
         if self.config.inference_backend == "local":

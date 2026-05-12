@@ -81,8 +81,37 @@ class Config:
     # switching the rendered half. Higher = more stable but slower to react.
     half_hysteresis_frames: int = 15
 
+    # Ball possession (which tracked player has the ball this frame)
+    # Pixel distance from ball center to a player's bbox — beyond this we
+    # consider the ball "loose" (mid-air, mid-pass, on the floor). 120px is
+    # roughly arm's reach in a 1080p broadcast frame; broadcasts that zoom
+    # tighter may need a larger value.
+    possession_max_distance_px: float = 120.0
+    # Frames a candidate must be nearest before we commit possession.
+    # Higher = more stable but slower to react to steals/rebounds.
+    possession_confirm_at: int = 3
+    # How many consecutive frames the ball can be missing / loose before
+    # we drop the current possessor. Smooths over single-frame detection
+    # gaps without holding stale possession across plays.
+    possession_release_after_missing: int = 8
+
+    # Shot/event detection (uses action classes the model already returns).
+    # shot_window: rolling per-track buffer of action labels (frames).
+    # shot_confirm_at: how many of the last shot_window frames must show a
+    #   shot action for the shot to be confirmed. Drops single-frame noise.
+    # made_window_frames: after a shot's last frame, look this many frames
+    #   ahead for a ball-in-basket observation to call it made. 18 ≈ 0.6s
+    #   at 30 fps — about how long the ball takes to drop through.
+    shot_window: int = 6
+    shot_confirm_at: int = 3
+    made_window_frames: int = 18
+
     # Team classification
     n_teams: int = 2  # 2 = just teams, 3 = teams + referees
+    # When set, every chest crop the classifier samples is saved as a PNG
+    # with V/S/accent values in the filename. Lets you visually verify the
+    # ROI lands on the jersey body — debug tool, not for production runs.
+    team_classifier_debug_crops: Optional[str] = None
     # When both team names are set, the classifier uses canonical NBA color
     # signatures (TEAM_PROFILES in team_classifier.py) and skips KMeans.
     # Recommended for any clip where you know the matchup — KMeans is brittle
@@ -155,6 +184,12 @@ class Config:
             help="Name of team 1 for supervised color classification "
                  "(e.g. 'sixers'). See --team-a.",
         )
+        parser.add_argument(
+            "--team-debug-crops", default=None,
+            help="Directory to dump every chest-crop the team classifier "
+                 "sampled, with V/S/accent values in each filename. Use to "
+                 "verify the ROI is on the jersey body.",
+        )
 
         args = parser.parse_args()
         return cls(
@@ -178,6 +213,7 @@ class Config:
             jersey_sample_every=args.jersey_sample_every,
             team_a=args.team_a,
             team_b=args.team_b,
+            team_classifier_debug_crops=args.team_debug_crops,
         )
 
     @classmethod

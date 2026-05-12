@@ -15,7 +15,9 @@ import supervision as sv
 from config import Config
 from detector import PlayerDetector, CourtKeypointDetector
 from tracker import PlayerTracker
-from mapper import CourtMapper, MappedPlayer
+from mapper import CourtMapper, MappedBall, MappedPlayer
+from possession import PossessionTracker
+from events import EventDetector, ShotEvent
 from team_classifier import TeamClassifier, resolve_team_profile
 from jersey import (
     JerseyNumberRecognizer, JerseyRead, JerseyVoter,
@@ -40,6 +42,16 @@ class Pipeline:
         self.tracker = PlayerTracker(config)
         self.mapper = CourtMapper(config)
         self.team_classifier = self._build_team_classifier(config)
+        self.possession = PossessionTracker(
+            max_distance_px=config.possession_max_distance_px,
+            confirm_at=config.possession_confirm_at,
+            release_after_missing=config.possession_release_after_missing,
+        )
+        self.events = EventDetector(
+            shot_window=config.shot_window,
+            shot_confirm_at=config.shot_confirm_at,
+            made_window_frames=config.made_window_frames,
+        )
         self.half_selector = ActiveHalfSelector(
             history_frames=config.half_hysteresis_frames,
         )
@@ -97,6 +109,7 @@ class Pipeline:
             n_teams=2,
             team_anchors=[anchor_a, anchor_b],
             team_names=[config.team_a, config.team_b],
+            debug_crop_dir=config.team_classifier_debug_crops,
         )
 
     def run(self):
@@ -145,11 +158,13 @@ class Pipeline:
                     break
 
                 # 1+2. Run court keypoint and player detection in parallel
-                # (both are I/O-bound HTTP calls to Roboflow ~1s each).
+                # (both are I/O-bound HTTP calls to Roboflow ~1s each). The
+                # player call also returns ball + action observations from
+                # the same response — free, since it's the same model.
                 keypoints_fut = self._detector_pool.submit(self.court_detector.detect, frame)
-                players_fut = self._detector_pool.submit(self.player_detector.detect, frame)
+                players_fut = self._detector_pool.submit(self.player_detector.detect_all, frame)
                 keypoints = keypoints_fut.result()
-                raw_players = players_fut.result()
+                raw_players, ball, actions = players_fut.result()
 
                 # 3. Track players (assign persistent IDs first — the team
                 #    classifier aggregates per track_id, so it needs them).
@@ -177,6 +192,29 @@ class Pipeline:
                 if h_valid:
                     valid_homography_count += 1
 
+                # 6.2 Possession: which tracked player has the ball this frame.
+                #     Run against the tracked players (with track_ids), not
+                #     mapped players, because the ball signal is in pixel space.
+                possession = self.possession.update(ball, tracked_players)
+                if possession.possessor_track_id is not None:
+                    for mp in mapped_players:
+                        mp.has_ball = (mp.track_id == possession.possessor_track_id)
+
+                # 6.3 Map the ball to court coords (uses cached H, so fine
+                #     even when the current frame had no fresh keypoints).
+                mapped_ball = self.mapper.map_ball(ball)
+                if mapped_ball is not None:
+                    mapped_ball.possessor_track_id = possession.possessor_track_id
+
+                # 6.35 Event detection: shot attempts + makes from action
+                #      classes the model returned this frame.
+                self.events.update(
+                    frame_idx=frame_count,
+                    actions=actions,
+                    tracked_players=tracked_players,
+                    mapped_players=mapped_players,
+                )
+
                 # 6.4 Jersey OCR on unlocked tracks (every Nth frame per track)
                 if self.jersey_recognizer is not None:
                     self._update_jersey_numbers(frame, mapped_players, frame_count)
@@ -192,6 +230,10 @@ class Pipeline:
                     h_valid,
                     active_half=active_half,
                     keypoints=keypoints if self.config.debug else None,
+                    ball=ball,
+                    mapped_ball=mapped_ball,
+                    shot_events=self.events.events,
+                    current_frame=frame_count,
                 )
 
                 # 8. Write frame
@@ -205,6 +247,8 @@ class Pipeline:
                     homography_valid=h_valid,
                     keypoints_detected=len(keypoints),
                     active_half=active_half,
+                    mapped_ball=mapped_ball,
+                    possessor_track_id=possession.possessor_track_id,
                 )
                 all_frame_data.append(frame_data)
 
@@ -225,15 +269,46 @@ class Pipeline:
         self._save_json(all_frame_data, json_out)
         self._save_csv(all_frame_data, csv_out)
 
+        # Save shot/event log
+        events_out = os.path.join(self.config.output_dir, "output_events.json")
+        self._save_events(self.events.events, events_out)
+
         # Print summary
+        n_events = len(self.events.events)
+        made = sum(1 for e in self.events.events if e.made)
         print()
         print("=" * 60)
         print(f"Done! Processed {processed} frames in {elapsed:.1f}s ({processed / elapsed:.1f} fps)")
         print(f"Homography valid: {valid_homography_count}/{processed} frames ({valid_homography_count / max(processed, 1) * 100:.0f}%)")
-        print(f"Output video: {video_out}")
-        print(f"Output JSON:  {json_out}")
-        print(f"Output CSV:   {csv_out}")
+        print(f"Shot events: {n_events} ({made} made, {n_events - made} missed)")
+        print(f"Output video:  {video_out}")
+        print(f"Output JSON:   {json_out}")
+        print(f"Output CSV:    {csv_out}")
+        print(f"Output events: {events_out}")
         print("=" * 60)
+
+    def _save_events(self, events: List[ShotEvent], path: str):
+        """Persist the shot-event log as JSON. One entry per attempt."""
+        payload = [
+            {
+                "shooter_track_id": e.shooter_track_id,
+                "team_id": e.team_id,
+                "shot_type": e.shot_type,
+                "made": e.made,
+                "frame_start": e.frame_start,
+                "frame_end": e.frame_end,
+                "court_x": (
+                    round(e.court_x, 2) if e.court_x is not None else None
+                ),
+                "court_y": (
+                    round(e.court_y, 2) if e.court_y is not None else None
+                ),
+                "block_track_id": e.block_track_id,
+            }
+            for e in events
+        ]
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
 
     def _update_jersey_numbers(
         self,
@@ -294,13 +369,27 @@ class Pipeline:
         homography_valid: bool,
         keypoints_detected: int,
         active_half: Optional[str] = None,
+        mapped_ball: Optional[MappedBall] = None,
+        possessor_track_id: Optional[int] = None,
     ) -> dict:
+        ball_record: Optional[dict] = None
+        if mapped_ball is not None:
+            ball_record = {
+                "court_x": round(mapped_ball.court_x, 2),
+                "court_y": round(mapped_ball.court_y, 2),
+                "pixel_x": round(mapped_ball.pixel_x, 1),
+                "pixel_y": round(mapped_ball.pixel_y, 1),
+                "confidence": round(mapped_ball.confidence, 3),
+                "possessor_track_id": possessor_track_id,
+            }
         return {
             "frame": frame_idx,
             "timestamp_ms": round(timestamp_ms, 1),
             "homography_valid": homography_valid,
             "keypoints_detected": keypoints_detected,
             "active_half": active_half,
+            "possessor_track_id": possessor_track_id,
+            "ball": ball_record,
             "players": [
                 {
                     "track_id": p.track_id,
@@ -313,6 +402,7 @@ class Pipeline:
                     "team_id": p.team_id,
                     "jersey_number": p.jersey_number,
                     "jersey_locked": p.jersey_locked,
+                    "has_ball": p.has_ball,
                 }
                 for p in mapped_players
             ],
@@ -329,6 +419,7 @@ class Pipeline:
                 "frame", "timestamp_ms", "homography_valid",
                 "track_id", "court_x", "court_y",
                 "pixel_x", "pixel_y", "confidence", "class_name", "team_id",
+                "has_ball",
             ])
             for frame_data in data:
                 for p in frame_data["players"]:
@@ -344,4 +435,5 @@ class Pipeline:
                         p["confidence"],
                         p["class_name"],
                         p["team_id"],
+                        p.get("has_ball", False),
                     ])

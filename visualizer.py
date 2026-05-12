@@ -10,7 +10,17 @@ import supervision as sv
 from config import Config
 from court import COURT_LENGTH, COURT_WIDTH, court_to_minimap, court_to_minimap_half, is_on_half
 from court_template import generate_court_image, generate_half_court_image
-from mapper import MappedPlayer
+from detector import BallDetection
+from events import ShotEvent
+from mapper import MappedBall, MappedPlayer
+
+# Visualization constants for the ball.
+_BALL_BGR = (40, 140, 255)        # broadcast-orange
+_BALL_OUTLINE_BGR = (0, 0, 0)     # black ring for contrast on any background
+
+# Shot-marker colors on the minimap (BGR).
+_MADE_BGR = (60, 200, 60)         # green
+_MISSED_BGR = (60, 60, 220)       # red
 
 
 class MinimapRenderer:
@@ -30,12 +40,18 @@ class MinimapRenderer:
         self,
         mapped_players: List[MappedPlayer],
         homography_valid: bool = True,
+        mapped_ball: Optional[MappedBall] = None,
+        shot_events: Optional[List[ShotEvent]] = None,
     ) -> np.ndarray:
         """Render the minimap with current player positions.
 
         Args:
             mapped_players: Players with court coordinates.
             homography_valid: Whether the current homography is valid.
+            mapped_ball: Optional ball position in court coordinates.
+            shot_events: Optional list of past shot events. Made shots
+                render as green dots, missed as red. Draws all events to
+                this frame so you can see the accumulated shot chart.
 
         Returns:
             BGR image of the minimap.
@@ -73,7 +89,9 @@ class MinimapRenderer:
                 trail_color = tuple(int(c * alpha) for c in color)
                 cv2.line(img, trail[i - 1], trail[i], trail_color, 1)
 
-            # Draw player dot
+            # Draw player dot; possessor gets a halo ring to stand out.
+            if player.has_ball:
+                cv2.circle(img, (px, py), 9, _BALL_BGR, 2)
             cv2.circle(img, (px, py), 5, color, -1)
             cv2.circle(img, (px, py), 5, (255, 255, 255), 1)  # white outline
 
@@ -89,6 +107,37 @@ class MinimapRenderer:
                 img, label, (px + 7, py + 3),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), thickness,
             )
+
+        # Draw shot markers — every made/missed shot to date. Drawn BEFORE
+        # the ball so the live ball dot stays on top.
+        if shot_events:
+            for ev in shot_events:
+                if ev.court_x is None or ev.court_y is None:
+                    continue
+                sx, sy = court_to_minimap(
+                    ev.court_x, ev.court_y,
+                    self.config.minimap_width, self.config.minimap_height,
+                    self.config.minimap_padding,
+                )
+                color = _MADE_BGR if ev.made else _MISSED_BGR
+                if ev.made:
+                    cv2.circle(img, (sx, sy), 5, color, -1)
+                    cv2.circle(img, (sx, sy), 5, (255, 255, 255), 1)
+                else:
+                    # X for misses — easy to distinguish at a glance.
+                    cv2.line(img, (sx - 4, sy - 4), (sx + 4, sy + 4), color, 2)
+                    cv2.line(img, (sx - 4, sy + 4), (sx + 4, sy - 4), color, 2)
+
+        # Draw ball as an orange dot on the court. Drawn last so it sits on
+        # top of player dots when they overlap (e.g. ball in possession).
+        if mapped_ball is not None:
+            bx, by = court_to_minimap(
+                mapped_ball.court_x, mapped_ball.court_y,
+                self.config.minimap_width, self.config.minimap_height,
+                self.config.minimap_padding,
+            )
+            cv2.circle(img, (bx, by), 4, _BALL_OUTLINE_BGR, -1)
+            cv2.circle(img, (bx, by), 3, _BALL_BGR, -1)
 
         return img
 
@@ -134,6 +183,8 @@ class HalfCourtMinimapRenderer:
         side: Optional[str],
         mapped_players: List[MappedPlayer],
         homography_valid: bool = True,
+        mapped_ball: Optional[MappedBall] = None,
+        shot_events: Optional[List[ShotEvent]] = None,
     ) -> np.ndarray:
         """Render the half-court minimap for the given side.
 
@@ -178,6 +229,8 @@ class HalfCourtMinimapRenderer:
                 trail_color = tuple(int(c * alpha) for c in color)
                 cv2.line(img, trail[i - 1], trail[i], trail_color, 1)
 
+            if player.has_ball:
+                cv2.circle(img, (px, py), 12, _BALL_BGR, 2)
             cv2.circle(img, (px, py), 7, color, -1)
             cv2.circle(img, (px, py), 7, (255, 255, 255), 1)
             if player.jersey_number is not None:
@@ -191,6 +244,37 @@ class HalfCourtMinimapRenderer:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), thickness,
             )
 
+        # Draw shot markers (only those on the active half).
+        if shot_events:
+            for ev in shot_events:
+                if (
+                    ev.court_x is None
+                    or ev.court_y is None
+                    or not is_on_half(ev.court_x, side)
+                ):
+                    continue
+                sx, sy = court_to_minimap_half(
+                    ev.court_x, ev.court_y, side,
+                    self.width, self.height, self.padding,
+                )
+                color = _MADE_BGR if ev.made else _MISSED_BGR
+                if ev.made:
+                    cv2.circle(img, (sx, sy), 7, color, -1)
+                    cv2.circle(img, (sx, sy), 7, (255, 255, 255), 1)
+                else:
+                    cv2.line(img, (sx - 6, sy - 6), (sx + 6, sy + 6), color, 2)
+                    cv2.line(img, (sx - 6, sy + 6), (sx + 6, sy - 6), color, 2)
+
+        # Draw the ball — only if it falls on the active half (otherwise
+        # we'd be plotting at clamped boundary coords and confusing the eye).
+        if mapped_ball is not None and is_on_half(mapped_ball.court_x, side):
+            bx, by = court_to_minimap_half(
+                mapped_ball.court_x, mapped_ball.court_y, side,
+                self.width, self.height, self.padding,
+            )
+            cv2.circle(img, (bx, by), 5, _BALL_OUTLINE_BGR, -1)
+            cv2.circle(img, (bx, by), 4, _BALL_BGR, -1)
+
         return img
 
 
@@ -203,16 +287,25 @@ class OverlayRenderer:
     classification visually.
     """
 
-    # BGR colors for team_id 0, 1, 2, -1
+    # BGR colors for team_id 0, 1, 2, -1. Picked to be MAXIMALLY distinct
+    # so you can read team assignments at a glance — pure saturated blue
+    # vs pure saturated red vs bright magenta for unknown. Previously
+    # team-0 (200,100,50) and unknown (200,200,200) shared a high blue
+    # channel and looked similar on screen, which made T-1 boxes around
+    # unclassified players read as "team 0" to the eye.
     _TEAM_BGR = {
-        0: (200, 100, 50),    # team 0 → blue-ish
-        1: (40, 40, 220),     # team 1 → red-ish
-        2: (0, 220, 220),     # team 2 (refs) → yellow
-        -1: (200, 200, 200),  # unknown → light gray
+        0: (255, 0, 0),        # team 0 → pure blue
+        1: (0, 0, 255),        # team 1 → pure red
+        2: (0, 220, 220),      # team 2 (refs) → yellow
+        -1: (255, 0, 255),     # unknown → bright magenta (impossible to miss)
     }
 
     def __init__(self, config: Config):
         self.config = config
+
+    # How many frames a "SHOT MADE" / "SHOT MISSED" banner stays visible.
+    # At 30 fps, 45 ≈ 1.5s — long enough to read without lingering forever.
+    _BANNER_PERSIST_FRAMES = 45
 
     def render(
         self,
@@ -221,18 +314,38 @@ class OverlayRenderer:
         mapped_players: Optional[List[MappedPlayer]] = None,
         keypoints=None,
         debug: bool = False,
+        ball: Optional[BallDetection] = None,
+        shot_events: Optional[List[ShotEvent]] = None,
+        current_frame: int = 0,
     ) -> np.ndarray:
-        """Draw team-colored boxes + track ID labels."""
+        """Draw team-colored boxes + track ID labels + ball + possession ring.
+
+        If a shot event ended within the last `_BANNER_PERSIST_FRAMES`
+        frames, also render a green/red banner along the top of the frame.
+        """
         annotated = frame.copy()
 
         if mapped_players:
             for p in mapped_players:
                 x1, y1, x2, y2 = [int(v) for v in p.bbox]
                 color = self._TEAM_BGR.get(p.team_id, self._TEAM_BGR[-1])
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+                # Possessor gets a thicker box so it pops on the broadcast feed.
+                box_thickness = 4 if p.has_ball else 2
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, box_thickness)
+
+                # Mark the possessor explicitly. The 🏀 emoji doesn't render
+                # reliably in cv2 fonts so use a plain "BALL" tag.
+                if p.has_ball:
+                    cv2.rectangle(
+                        annotated, (x1 - 2, y1 - 2), (x2 + 2, y2 + 2),
+                        _BALL_BGR, 2,
+                    )
+
                 label = f"#{p.track_id} T{p.team_id}"
                 if p.jersey_number is not None:
                     label = f"#{p.jersey_number} T{p.team_id}"
+                if p.has_ball:
+                    label = f"BALL {label}"
                 (tw, th), _ = cv2.getTextSize(
                     label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1,
                 )
@@ -245,6 +358,19 @@ class OverlayRenderer:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
                 )
 
+        # Draw the ball as a filled orange disc with a black outline.
+        # Drawn AFTER players so it always sits on top of overlapping boxes.
+        if ball is not None:
+            bx, by = int(ball.center[0]), int(ball.center[1])
+            # Radius from bbox; ball bboxes are typically tight, so half the
+            # shorter side ≈ ball radius. Clamp to keep it visible in case
+            # the detector returns a 1-px ball.
+            bw = max(1, int(ball.bbox[2] - ball.bbox[0]))
+            bh = max(1, int(ball.bbox[3] - ball.bbox[1]))
+            radius = max(6, min(bw, bh) // 2)
+            cv2.circle(annotated, (bx, by), radius + 1, _BALL_OUTLINE_BGR, 2)
+            cv2.circle(annotated, (bx, by), radius, _BALL_BGR, -1)
+
         # Debug: draw detected court keypoints
         if debug and keypoints:
             for kp in keypoints:
@@ -256,6 +382,38 @@ class OverlayRenderer:
                 cv2.putText(
                     annotated, kp.name, (px + 10, py - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1,
+                )
+
+        # Recent-shot banner — flash MADE/MISSED across the top of the
+        # frame for a short window after the event resolves. Picks the
+        # most recent event still in-window so simultaneous events
+        # (basket + putback miss) don't fight for the banner.
+        if shot_events:
+            recent = [
+                e for e in shot_events
+                if 0 <= (current_frame - e.frame_end) <= self._BANNER_PERSIST_FRAMES
+            ]
+            if recent:
+                ev = recent[-1]
+                text = "SHOT MADE" if ev.made else "SHOT MISSED"
+                color = _MADE_BGR if ev.made else _MISSED_BGR
+                shooter = (
+                    f"#{ev.shooter_track_id}"
+                    if ev.shooter_track_id >= 0
+                    else "?"
+                )
+                full = f"{text}  {shooter}  ({ev.shot_type})"
+                (tw, th), _ = cv2.getTextSize(
+                    full, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2,
+                )
+                pad = 12
+                cv2.rectangle(
+                    annotated, (0, 0), (tw + pad * 2, th + pad * 2),
+                    color, -1,
+                )
+                cv2.putText(
+                    annotated, full, (pad, th + pad - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2,
                 )
 
         return annotated
@@ -297,14 +455,22 @@ class CompositeRenderer:
         homography_valid: bool,
         active_half: Optional[str] = None,
         keypoints=None,
+        ball: Optional[BallDetection] = None,
+        mapped_ball: Optional[MappedBall] = None,
+        shot_events: Optional[List[ShotEvent]] = None,
+        current_frame: int = 0,
     ) -> np.ndarray:
         annotated = self.overlay.render(
             frame, sv_detections, mapped_players,
             keypoints=keypoints, debug=self.config.debug,
+            ball=ball,
+            shot_events=shot_events,
+            current_frame=current_frame,
         )
 
         right_panel = self._render_right_panel(
-            mapped_players, homography_valid, active_half,
+            mapped_players, homography_valid, active_half, mapped_ball,
+            shot_events,
         )
 
         composite = np.hstack([annotated, right_panel])
@@ -321,7 +487,19 @@ class CompositeRenderer:
         # Status bar in bottom-right corner of the right panel
         status = "TRACKING" if homography_valid else "NO HOMOGRAPHY"
         half_str = active_half.upper() if active_half else "—"
-        text = f"{status} | {len(mapped_players)} players | half: {half_str}"
+        possessor = next(
+            (p for p in mapped_players if p.has_ball), None,
+        )
+        if possessor is not None:
+            label = (
+                f"#{possessor.jersey_number}"
+                if possessor.jersey_number is not None
+                else f"#{possessor.track_id}"
+            )
+            poss_str = f"BALL: {label} T{possessor.team_id}"
+        else:
+            poss_str = "BALL: loose"
+        text = f"{status} | {len(mapped_players)} pl | half: {half_str} | {poss_str}"
         cv2.putText(
             composite, text,
             (self.video_width + 10, self.video_height - 8),
@@ -334,6 +512,8 @@ class CompositeRenderer:
         mapped_players: List[MappedPlayer],
         homography_valid: bool,
         active_half: Optional[str],
+        mapped_ball: Optional[MappedBall] = None,
+        shot_events: Optional[List[ShotEvent]] = None,
     ) -> np.ndarray:
         """Returns the right-side panel scaled to height=video_height.
 
@@ -344,17 +524,28 @@ class CompositeRenderer:
         """
         view = self.config.view
         if view == "full":
-            mini = self.full.render(mapped_players, homography_valid)
+            mini = self.full.render(
+                mapped_players, homography_valid, mapped_ball, shot_events,
+            )
         elif view == "half":
-            mini = self.half.render(active_half, mapped_players, homography_valid)
+            mini = self.half.render(
+                active_half, mapped_players, homography_valid, mapped_ball,
+                shot_events,
+            )
         else:
             # "both" — full on top, half on bottom, stacked at common width
             target_w = self.config.minimap_width
             full_mini = _resize_to_width(
-                self.full.render(mapped_players, homography_valid), target_w,
+                self.full.render(
+                    mapped_players, homography_valid, mapped_ball, shot_events,
+                ),
+                target_w,
             )
             half_mini = _resize_to_width(
-                self.half.render(active_half, mapped_players, homography_valid),
+                self.half.render(
+                    active_half, mapped_players, homography_valid, mapped_ball,
+                    shot_events,
+                ),
                 target_w,
             )
             mini = np.vstack([full_mini, half_mini])
