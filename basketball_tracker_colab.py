@@ -23,8 +23,13 @@ applies here automatically (no inlined drift).
 #@title 1. Install dependencies and clone the repo
 #@markdown Installs the pipeline + (optional) GPU inference, then clones
 #@markdown this notebook's source repo into /content/tracker.
+#@markdown
+#@markdown ⚠️ Default branch is `claude/pedantic-wu-bb2183` — it contains
+#@markdown identity + per-player stats + made/missed shot detection that
+#@markdown haven't merged to `main` yet. Flip to `main` only if you want
+#@markdown the older codepath.
 REPO_URL = "https://github.com/eli-newman/basketball-court-tracker.git"  #@param {type:"string"}
-REPO_BRANCH = "main"  #@param {type:"string"}
+REPO_BRANCH = "claude/pedantic-wu-bb2183"  #@param {type:"string"}
 INSTALL_GPU_INFERENCE = True  #@param {type:"boolean"}
 
 import os, subprocess, sys
@@ -173,6 +178,27 @@ MAX_FRAMES = 0  #@param {type:"integer"}
 N_TEAMS = 2  #@param {type:"slider", min:2, max:3, step:1}
 DEBUG_MODE = False  #@param {type:"boolean"}
 
+#@markdown ### Team anchors (recommended)
+#@markdown Names from `team_classifier.TEAM_COLOR_PROFILES`. With both set,
+#@markdown the classifier locks teams to known jersey colors instead of
+#@markdown clustering on the clip — way more robust on short clips and
+#@markdown Knicks-blue vs Sixers-white in particular.
+TEAM_A = "knicks"  #@param {type:"string"}
+TEAM_B = "sixers"  #@param {type:"string"}
+
+#@markdown ### Jersey OCR (unlocks per-player stats + cross-cut identity)
+#@markdown When ON: the pipeline OCRs jersey numbers, collapses
+#@markdown (team, number) → persistent player_id across camera cuts, and
+#@markdown renders a TOP SCORERS panel in the bottom-left. Costs ~20%
+#@markdown extra runtime per locked-jersey-search frame.
+JERSEY_OCR = True  #@param {type:"boolean"}
+JERSEY_SAMPLE_EVERY = 5  #@param {type:"integer"}
+
+#@markdown ### Minimap view
+#@markdown `both`: full-court (top) + half-court (bottom) stacked next to
+#@markdown the broadcast frame. `full` and `half` show only one.
+VIEW = "both"  #@param ["both", "full", "half"]
+
 # Pull API key from Colab Secrets if not set inline
 if not ROBOFLOW_API_KEY:
     try:
@@ -205,7 +231,15 @@ cmd = [
     "--frame-skip", str(FRAME_SKIP),
     "--max-frames", str(MAX_FRAMES),
     "--n-teams", str(N_TEAMS),
+    "--view", VIEW,
 ]
+if TEAM_A:
+    cmd += ["--team-a", TEAM_A]
+if TEAM_B:
+    cmd += ["--team-b", TEAM_B]
+if JERSEY_OCR:
+    cmd += ["--jersey-ocr",
+            "--jersey-sample-every", str(JERSEY_SAMPLE_EVERY)]
 if DEBUG_MODE:
     cmd.append("--debug")
 
@@ -213,11 +247,99 @@ t0 = time.time()
 subprocess.run(cmd, check=True)
 print(f"\nWall time: {time.time() - t0:.1f}s")
 
-#@title 5. Preview the composite
-#@markdown Shows the side-by-side (broadcast + minimap) inline.
+#@title 5. Summary: scoreboard + top scorers + event count
+#@markdown Reads the JSON sidecars `main.py` wrote into OUTPUT_DIR and
+#@markdown prints a compact stats summary. Useful before sitting through
+#@markdown the full composite video.
+import json
+from IPython.display import display, Markdown
+
+def _read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+sb = _read_json(os.path.join(OUTPUT_DIR, "output_scoreboard.json")) or {}
+ps = _read_json(os.path.join(OUTPUT_DIR, "output_player_stats.json")) or {}
+ev = _read_json(os.path.join(OUTPUT_DIR, "output_events.json")) or []
+
+# Scoreboard line
+score_by_team = sb.get("score_by_team", {})
+team_labels = sb.get("team_labels", {})
+if score_by_team:
+    parts = []
+    for tid, pts in sorted(score_by_team.items(), key=lambda kv: int(kv[0])):
+        label = team_labels.get(str(tid)) or team_labels.get(tid) or f"T{tid}"
+        parts.append(f"**{label}** {pts}")
+    display(Markdown("### Final score\n" + "  •  ".join(parts)))
+
+# Shot events
+n_made = sum(1 for e in ev if e.get("made"))
+display(Markdown(
+    f"### Shot events\n"
+    f"`{len(ev)}` attempts · `{n_made}` made · `{len(ev) - n_made}` missed"
+))
+
+# Top scorers table — only populated when --jersey-ocr identified shooters
+players = ps.get("players", [])
+if players:
+    rows = sorted(players, key=lambda p: -p["points"])[:8]
+    lines = ["### Top scorers", "",
+             "| Team | # | PTS | FGM/FGA | FG% | 3PM/3PA |",
+             "|------|---|-----|---------|-----|---------|"]
+    for p in rows:
+        lines.append(
+            f"| {p.get('team') or 'T?'} | "
+            f"#{p.get('jersey_number') or '?'} | "
+            f"{p['points']} | "
+            f"{p['fgm']}/{p['fga']} | "
+            f"{int(p['fg_pct'] * 100)}% | "
+            f"{p['fg3m']}/{p['fg3a']} |"
+        )
+    display(Markdown("\n".join(lines)))
+else:
+    display(Markdown(
+        "### Top scorers\n"
+        "_No identified shooters yet — either jersey OCR was off, or no "
+        "jersey number locked before a shot resolved. Try enabling "
+        "`--jersey-ocr` and re-running on a longer segment._"
+    ))
+
+#@title 6. Preview the composite
+#@markdown Shows the side-by-side (broadcast + minimap) inline. For long
+#@markdown clips this base64-embeds a big chunk — fine on Colab Pro, can
+#@markdown OOM the browser tab on free tier. Use the Drive-sync cell below
+#@markdown instead if it chokes.
 from IPython.display import HTML
 import base64
 video_path = os.path.join(OUTPUT_DIR, "output_composite.mp4")
 mp4 = open(video_path, "rb").read()
 data_url = "data:video/mp4;base64," + base64.b64encode(mp4).decode()
 HTML(f'<video controls width=900 src="{data_url}"></video>')
+
+#@title 7. (Optional) Copy outputs to Google Drive so they survive runtime shutdown
+#@markdown Colab VMs are ephemeral — when the runtime disconnects, /content
+#@markdown is wiped. Run this to persist the run. Requires the Drive mount
+#@markdown cell (2) to have run.
+DRIVE_DEST = "/content/drive/MyDrive/basketball_output"  #@param {type:"string"}
+RUN_SYNC_TO_DRIVE = False  #@param {type:"boolean"}
+
+if RUN_SYNC_TO_DRIVE:
+    import shutil, datetime
+    assert os.path.ismount("/content/drive") or os.path.isdir("/content/drive/MyDrive"), \
+        "Drive isn't mounted — run cell 2 first."
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    target = os.path.join(DRIVE_DEST, f"run_{stamp}")
+    os.makedirs(target, exist_ok=True)
+    for name in os.listdir(OUTPUT_DIR):
+        src = os.path.join(OUTPUT_DIR, name)
+        dst = os.path.join(target, name)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, dst)
+    print(f"Synced {OUTPUT_DIR} → {target}")
+else:
+    print("Skipping Drive sync. Flip RUN_SYNC_TO_DRIVE to save outputs.")
