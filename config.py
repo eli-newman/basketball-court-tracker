@@ -43,7 +43,12 @@ class Config:
     # Jersey number OCR (opt-in — adds ~1 API call per tracked player per
     # `jersey_sample_every` frames, so it costs real wall time).
     enable_jersey_ocr: bool = False
-    jersey_model_id: str = "roboflow-jvuqo/basketball-jersey-numbers-ocr/7"
+    # Workspace prefix omitted on purpose: the local `inference` package's
+    # parser (`inference.core.utils.roboflow.get_model_id_chunks`) only
+    # accepts `<dataset>/<version>` and rejects the workspace-prefixed
+    # `roboflow-jvuqo/basketball-jersey-numbers-ocr/7` form, even though
+    # the hosted HTTP API accepts both. Short form works on both backends.
+    jersey_model_id: str = "basketball-jersey-numbers-ocr/7"
     jersey_confidence: float = 0.4
     jersey_sample_every: int = 5      # call OCR every Nth frame per track
     jersey_confirm_at: int = 3        # votes needed to lock a number
