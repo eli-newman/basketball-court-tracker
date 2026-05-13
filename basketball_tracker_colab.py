@@ -101,6 +101,8 @@ END_TIME = ""  #@param {type:"string"}
 MAX_HEIGHT = 720  #@param {type:"integer"}
 RUN_YT_INGEST = False  #@param {type:"boolean"}
 
+import os, subprocess  # noqa: E402 — make this cell standalone in case cell 1 was skipped
+
 INGESTED_PATH = None
 if RUN_YT_INGEST and YOUTUBE_URL:
     os.makedirs("/content/clips", exist_ok=True)
@@ -121,8 +123,8 @@ else:
 RUN_LOCAL_UPLOAD = False  #@param {type:"boolean"}
 
 if RUN_LOCAL_UPLOAD:
+    import os, shutil
     from google.colab import files
-    import shutil
     os.makedirs("/content/clips", exist_ok=True)
     uploaded = files.upload()
     if uploaded:
@@ -144,6 +146,7 @@ TARGET_WIDTH = 1280  #@param {type:"integer"}
 RUN_CLEAN = False  #@param {type:"boolean"}
 
 if RUN_CLEAN and SOURCE_PATH:
+    import os, subprocess
     os.makedirs("/content/clips", exist_ok=True)
     out_path = "/content/clips/cleaned.mp4"
     probe = subprocess.run(
