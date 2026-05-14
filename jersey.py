@@ -60,6 +60,17 @@ class JerseyNumberRecognizer:
 
     Reuses the same backend abstraction as PlayerDetector — either an HTTP
     POST to `inference_host` or in-process via the `inference` package.
+
+    Backend selection (`config.inference_backend`):
+      - "local": try the in-process `inference` package first. On CUDA
+        (Colab A100, T4) the BFloat16 PeftModel loads fine and we get
+        near-zero-latency OCR with no rate limits. On Apple Silicon (MPS)
+        the BFloat16 load fails; we fall back to the hosted HTTP API.
+      - "hosted": always HTTP. Cheap, but Roboflow's `/ocr` endpoint has
+        been throttling persistently — many runs come back HTTP 500.
+
+    The fallback flag is sticky: once we've seen the local path fail we
+    don't keep retrying it for every frame.
     """
 
     def __init__(self, config: Config):
@@ -67,22 +78,44 @@ class JerseyNumberRecognizer:
         self.api_url = (
             f"{config.inference_host.rstrip('/')}/{config.jersey_model_id}"
         )
+        # Sticky: flip True the first time _local_infer raises (e.g. MPS
+        # BFloat16 unsupported on a Mac dev box) so we don't pay the
+        # exception cost on every subsequent crop.
+        self._local_failed = False
 
     def read(self, chest_crop: np.ndarray) -> Optional[dict]:
         """Run one OCR call. Returns the raw {"predictions":[...]} dict.
 
-        Always uses the hosted HTTP API regardless of the player/court
-        detection backend. Reason: the Roboflow jersey OCR model is a
-        PeftModel with BFloat16 weights, which fails to load on Apple
-        Silicon (MPS doesn't support BFloat16) — and forcing the model
-        to CPU adds complexity for marginal benefit since OCR runs
-        infrequently (every Nth frame per unlocked track) and chest
-        crops are small. Hybrid: local for heavy player/court inference,
-        hosted for cheap OCR. Caller's `inference_backend` setting still
-        controls everything else.
+        See class docstring for backend-selection rules.
         """
         if chest_crop.size == 0:
             return None
+
+        # Local path: only when the caller asked for it AND we haven't
+        # already discovered this machine can't run the model.
+        if self.config.inference_backend == "local" and not self._local_failed:
+            try:
+                resp = _local_infer(
+                    self.config.jersey_model_id,
+                    self.config.roboflow_api_key,
+                    chest_crop,
+                    self.config.jersey_confidence,
+                )
+                if resp is not None:
+                    return resp
+                # _local_infer returned None — usually means an error was
+                # already printed inside it. Don't keep retrying locally
+                # if the model itself failed to load; fall through and
+                # set the sticky flag so we use hosted from here on.
+                self._local_failed = True
+            except Exception as e:  # pragma: no cover — env-dependent
+                print(
+                    f"[jersey] local OCR unavailable ({type(e).__name__}: {e}); "
+                    f"falling back to hosted for the rest of the run."
+                )
+                self._local_failed = True
+
+        # Hosted fallback.
         _, buffer = cv2.imencode(".jpg", chest_crop)
         img_b64 = base64.b64encode(buffer).decode("utf-8")
         return _post_with_retry(
