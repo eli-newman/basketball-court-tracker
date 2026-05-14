@@ -55,16 +55,20 @@ class JerseyNumberRecognizer:
         )
 
     def read(self, chest_crop: np.ndarray) -> Optional[dict]:
-        """Run one OCR call. Returns the raw {"predictions":[...]} dict."""
+        """Run one OCR call. Returns the raw {"predictions":[...]} dict.
+
+        Always uses the hosted HTTP API regardless of the player/court
+        detection backend. Reason: the Roboflow jersey OCR model is a
+        PeftModel with BFloat16 weights, which fails to load on Apple
+        Silicon (MPS doesn't support BFloat16) — and forcing the model
+        to CPU adds complexity for marginal benefit since OCR runs
+        infrequently (every Nth frame per unlocked track) and chest
+        crops are small. Hybrid: local for heavy player/court inference,
+        hosted for cheap OCR. Caller's `inference_backend` setting still
+        controls everything else.
+        """
         if chest_crop.size == 0:
             return None
-        if self.config.inference_backend == "local":
-            return _local_infer(
-                self.config.jersey_model_id,
-                self.config.roboflow_api_key,
-                chest_crop,
-                self.config.jersey_confidence,
-            )
         _, buffer = cv2.imencode(".jpg", chest_crop)
         img_b64 = base64.b64encode(buffer).decode("utf-8")
         return _post_with_retry(
