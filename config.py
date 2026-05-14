@@ -115,7 +115,7 @@ class Config:
     # above which a hard cut is declared (then tracker, possession, and
     # in-progress shots all reset). Empirically 0.45 sits cleanly between
     # "lots of camera motion" (~0.25) and "different scene" (~0.55+).
-    cut_threshold: float = 0.45
+    cut_threshold: float = 0.35
 
     # Team classification
     n_teams: int = 2  # 2 = just teams, 3 = teams + referees

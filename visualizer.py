@@ -26,13 +26,17 @@ _MADE_BGR = (60, 200, 60)         # green
 _MISSED_BGR = (60, 60, 220)       # red
 
 # Trail discontinuity thresholds — used to skip drawing a line segment
-# between two consecutive trail points that look impossible.
-# A real player moves at most ~22 ft/sec (sprint) ≈ 0.73 ft/frame at 30fps,
-# so 8 ft between consecutive samples is well beyond human motion and almost
-# always means a tracker ID swap or an off-screen reappearance. Skipping
-# those segments visually unclutters the minimap.
-_TRAIL_MAX_FRAME_GAP = 3       # frames; >3 = the track was missing
-_TRAIL_MAX_COURT_DIST_FT = 8.0  # feet; >8 = impossible physical motion
+# between two consecutive trail points that look impossible. Tightened
+# after real-clip observation showed 8 ft / 3-frame gaps were generous
+# enough to let track-ID swaps draw long across-court lines.
+#
+# A real player moves at most ~22 ft/sec (sprint) ≈ 0.73 ft/frame at 30fps.
+# 4 ft between adjacent samples corresponds to ~5 frames of full-sprint
+# motion — well above normal but cuts off teleport-style ID swaps that
+# happen on a single frame. 2-frame gap covers brief occlusions; longer
+# gaps reliably mean the same track_id was reissued to a different human.
+_TRAIL_MAX_FRAME_GAP = 2       # frames; >2 = the track was missing
+_TRAIL_MAX_COURT_DIST_FT = 4.0  # feet; >4 = likely tracker ID swap
 
 # Scoreboard panel layout (top-right of broadcast frame).
 _SCOREBOARD_PAD = 12

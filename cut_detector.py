@@ -40,8 +40,13 @@ import numpy as np
 #   - smooth pan / zoom:   ~0.05 – 0.20
 #   - player crowd-shot:   ~0.25 – 0.40
 #   - hard cut:            ~0.50 – 0.90
-# 0.45 sits cleanly between "lots of camera motion" and "different scene."
-_DEFAULT_CUT_THRESHOLD = 0.45
+# 0.35 catches angle-to-angle cuts (sideline → baseline) that 0.45
+# missed — observed in the Knicks/Sixers clip where only 5 of an
+# expected ~12 cuts fired, leaving stale tracker IDs and homography
+# cached across real scene changes. Trade-off: a fast camera pan with
+# a player crowding the lens can briefly cross 0.35; the refractory
+# window keeps that to one cut per scene.
+_DEFAULT_CUT_THRESHOLD = 0.35
 
 # Don't fire two cuts within this many frames. Catches double-edges
 # (e.g. a 2-frame black flash between scenes that would otherwise

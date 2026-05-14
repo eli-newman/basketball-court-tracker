@@ -265,6 +265,28 @@ class Pipeline:
                 mapped_ball = self.mapper.map_ball(ball)
                 if mapped_ball is not None:
                     mapped_ball.possessor_track_id = possession.possessor_track_id
+                    # When a player is confirmed possessor, snap the ball
+                    # minimap position to their court coords. The ball's own
+                    # projected position is biased toward the camera whenever
+                    # it's above floor level — even a chest-height ball can
+                    # land 10ft off on the minimap. The possessor IS holding
+                    # it, so by definition that's the truthful ball location.
+                    if possession.possessor_track_id is not None:
+                        for mp in mapped_players:
+                            if mp.track_id == possession.possessor_track_id:
+                                mapped_ball.court_x = mp.court_x
+                                mapped_ball.court_y = mp.court_y
+                                break
+                    elif ball is not None and frame is not None:
+                        # Loose ball with no possessor: if it's clearly in
+                        # the upper half of the frame it's airborne (shot or
+                        # pass) and the floor-plane projection puts it 5–15
+                        # ft off. Hide it from the minimap rather than show
+                        # a misleading position; the broadcast frame still
+                        # shows the actual ball overlay.
+                        frame_h = frame.shape[0]
+                        if ball.center[1] < frame_h * 0.5:
+                            mapped_ball = None
 
                 # 6.35 Event detection: shot attempts + makes from action
                 #      classes the model returned this frame.
