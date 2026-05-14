@@ -61,7 +61,7 @@ class Config:
     max_reproj_error: float = 10.0
 
     # Coordinate smoothing
-    smoothing_window: int = 5
+    smoothing_window: int = 9
 
     # Processing
     frame_skip: int = 1

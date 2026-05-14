@@ -42,6 +42,14 @@ class HomographyEngine:
 
         self._last_good_H: Optional[np.ndarray] = None
         self._frames_since_good: int = 0
+        # Smoothed homography — EMA of recent raw H matrices, normalized by
+        # H[2,2] to dodge the projective scale ambiguity. Without this each
+        # frame's keypoint noise turns into ~1-3 ft of position jitter for
+        # every stationary player on the minimap. With alpha=0.25 the
+        # effective time constant is ~4 frames (~130ms at 30fps) — fast
+        # enough to track real camera pans, slow enough to swallow the
+        # frame-to-frame keypoint wobble.
+        self._smoothed_H: Optional[np.ndarray] = None
 
     def compute(self, keypoints: List[CourtKeypoint]) -> Optional[np.ndarray]:
         """Compute homography from detected keypoints.
@@ -81,10 +89,30 @@ class HomographyEngine:
         if not self._validate(H, src, dst, inlier_mask):
             return self._fallback()
 
-        # Good homography — cache it
-        self._last_good_H = H.copy()
+        # Normalize raw H by H[2,2] to fix the projective scale ambiguity
+        # before any averaging — without this the EMA blend would be
+        # dominated by whichever frame's H happened to have larger scale.
+        if abs(H[2, 2]) > 1e-9:
+            H = H / H[2, 2]
+
+        # EMA-smooth the homography. New frame contributes alpha; the
+        # smoothed-so-far contributes (1 - alpha). Element-wise blend
+        # works in practice for small frame-to-frame changes; for big
+        # jumps (camera cut) the cut detector resets `_smoothed_H` via
+        # `reset()` so we don't carry the previous angle's transform.
+        alpha = 0.25
+        if self._smoothed_H is None:
+            self._smoothed_H = H.copy()
+        else:
+            blended = (1.0 - alpha) * self._smoothed_H + alpha * H
+            if abs(blended[2, 2]) > 1e-9:
+                blended = blended / blended[2, 2]
+            self._smoothed_H = blended
+
+        # Cache + return the smoothed transform.
+        self._last_good_H = self._smoothed_H.copy()
         self._frames_since_good = 0
-        return H
+        return self._smoothed_H.copy()
 
     def transform_point(
         self, H: np.ndarray, pixel_x: float, pixel_y: float
@@ -124,9 +152,13 @@ class HomographyEngine:
         return [self.transform_point(H, px, py) for px, py in points]
 
     def reset(self):
-        """Reset cached homography (e.g., on camera cut)."""
+        """Reset cached homography (e.g., on camera cut). Also clears the
+        EMA-smoothed H so the next angle's transform doesn't get blended
+        with the previous angle's — they're rarely close in matrix space.
+        """
         self._last_good_H = None
         self._frames_since_good = 0
+        self._smoothed_H = None
 
     @property
     def has_valid_homography(self) -> bool:
