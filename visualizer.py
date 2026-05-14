@@ -25,6 +25,15 @@ _BALL_OUTLINE_BGR = (0, 0, 0)     # black ring for contrast on any background
 _MADE_BGR = (60, 200, 60)         # green
 _MISSED_BGR = (60, 60, 220)       # red
 
+# Trail discontinuity thresholds — used to skip drawing a line segment
+# between two consecutive trail points that look impossible.
+# A real player moves at most ~22 ft/sec (sprint) ≈ 0.73 ft/frame at 30fps,
+# so 8 ft between consecutive samples is well beyond human motion and almost
+# always means a tracker ID swap or an off-screen reappearance. Skipping
+# those segments visually unclutters the minimap.
+_TRAIL_MAX_FRAME_GAP = 3       # frames; >3 = the track was missing
+_TRAIL_MAX_COURT_DIST_FT = 8.0  # feet; >8 = impossible physical motion
+
 # Scoreboard panel layout (top-right of broadcast frame).
 _SCOREBOARD_PAD = 12
 _SCOREBOARD_BG = (30, 30, 30)
@@ -50,6 +59,7 @@ class MinimapRenderer:
         homography_valid: bool = True,
         mapped_ball: Optional[MappedBall] = None,
         shot_events: Optional[List[ShotEvent]] = None,
+        current_frame: int = 0,
     ) -> np.ndarray:
         """Render the minimap with current player positions.
 
@@ -85,17 +95,30 @@ class MinimapRenderer:
 
             color = self._get_player_color(player)
 
-            # Update trail
+            # Update trail. Store court coords + frame_idx alongside pixels so
+            # we can skip drawing impossible segments (off-screen → reappear,
+            # tracker ID swap) on the rendering side.
             if player.track_id not in self._trails:
                 self._trails[player.track_id] = deque(maxlen=self.trail_length)
-            self._trails[player.track_id].append((px, py))
+            self._trails[player.track_id].append(
+                (px, py, player.court_x, player.court_y, current_frame)
+            )
 
-            # Draw trail
+            # Draw trail — skip discontinuities.
             trail = list(self._trails[player.track_id])
             for i in range(1, len(trail)):
+                prev_px, prev_py, prev_cx, prev_cy, prev_f = trail[i - 1]
+                cur_px, cur_py, cur_cx, cur_cy, cur_f = trail[i]
+                # Skip if the track was missing for several frames or jumped
+                # impossibly far on the court — those are not real motion.
+                if cur_f - prev_f > _TRAIL_MAX_FRAME_GAP:
+                    continue
+                dx, dy = cur_cx - prev_cx, cur_cy - prev_cy
+                if (dx * dx + dy * dy) > _TRAIL_MAX_COURT_DIST_FT ** 2:
+                    continue
                 alpha = i / len(trail)
                 trail_color = tuple(int(c * alpha) for c in color)
-                cv2.line(img, trail[i - 1], trail[i], trail_color, 1)
+                cv2.line(img, (prev_px, prev_py), (cur_px, cur_py), trail_color, 1)
 
             # Draw player dot; possessor gets a halo ring to stand out.
             if player.has_ball:
@@ -200,6 +223,7 @@ class HalfCourtMinimapRenderer:
         homography_valid: bool = True,
         mapped_ball: Optional[MappedBall] = None,
         shot_events: Optional[List[ShotEvent]] = None,
+        current_frame: int = 0,
     ) -> np.ndarray:
         """Render the half-court minimap for the given side.
 
@@ -236,13 +260,22 @@ class HalfCourtMinimapRenderer:
             key = (side, player.track_id)
             if key not in self._trails:
                 self._trails[key] = deque(maxlen=self.trail_length)
-            self._trails[key].append((px, py))
+            self._trails[key].append(
+                (px, py, player.court_x, player.court_y, current_frame)
+            )
 
             trail = list(self._trails[key])
             for i in range(1, len(trail)):
+                prev_px, prev_py, prev_cx, prev_cy, prev_f = trail[i - 1]
+                cur_px, cur_py, cur_cx, cur_cy, cur_f = trail[i]
+                if cur_f - prev_f > _TRAIL_MAX_FRAME_GAP:
+                    continue
+                dx, dy = cur_cx - prev_cx, cur_cy - prev_cy
+                if (dx * dx + dy * dy) > _TRAIL_MAX_COURT_DIST_FT ** 2:
+                    continue
                 alpha = i / len(trail)
                 trail_color = tuple(int(c * alpha) for c in color)
-                cv2.line(img, trail[i - 1], trail[i], trail_color, 1)
+                cv2.line(img, (prev_px, prev_py), (cur_px, cur_py), trail_color, 1)
 
             if player.has_ball:
                 cv2.circle(img, (px, py), 12, _BALL_BGR, 2)
@@ -713,7 +746,7 @@ class CompositeRenderer:
 
         right_panel = self._render_right_panel(
             mapped_players, homography_valid, active_half, mapped_ball,
-            shot_events,
+            shot_events, current_frame=current_frame,
         )
 
         composite = np.hstack([annotated, right_panel])
@@ -757,6 +790,7 @@ class CompositeRenderer:
         active_half: Optional[str],
         mapped_ball: Optional[MappedBall] = None,
         shot_events: Optional[List[ShotEvent]] = None,
+        current_frame: int = 0,
     ) -> np.ndarray:
         """Returns the right-side panel scaled to height=video_height.
 
@@ -769,11 +803,12 @@ class CompositeRenderer:
         if view == "full":
             mini = self.full.render(
                 mapped_players, homography_valid, mapped_ball, shot_events,
+                current_frame=current_frame,
             )
         elif view == "half":
             mini = self.half.render(
                 active_half, mapped_players, homography_valid, mapped_ball,
-                shot_events,
+                shot_events, current_frame=current_frame,
             )
         else:
             # "both" — full on top, half on bottom, stacked at common width
@@ -781,13 +816,14 @@ class CompositeRenderer:
             full_mini = _resize_to_width(
                 self.full.render(
                     mapped_players, homography_valid, mapped_ball, shot_events,
+                    current_frame=current_frame,
                 ),
                 target_w,
             )
             half_mini = _resize_to_width(
                 self.half.render(
                     active_half, mapped_players, homography_valid, mapped_ball,
-                    shot_events,
+                    shot_events, current_frame=current_frame,
                 ),
                 target_w,
             )
