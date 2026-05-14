@@ -26,7 +26,8 @@ from scoreboard import Scoreboard
 from team_classifier import TeamClassifier, resolve_team_profile
 from jersey import (
     JerseyNumberRecognizer, JerseyRead, JerseyVoter,
-    crop_chest, parse_jersey_response,
+    crop_chest, crop_number_bbox, match_number_to_player,
+    parse_jersey_response, preprocess_for_ocr,
 )
 from view_selector import ActiveHalfSelector
 from visualizer import CompositeRenderer
@@ -224,7 +225,7 @@ class Pipeline:
                 keypoints_fut = self._detector_pool.submit(self.court_detector.detect, frame)
                 players_fut = self._detector_pool.submit(self.player_detector.detect_all, frame)
                 keypoints = keypoints_fut.result()
-                raw_players, ball, actions = players_fut.result()
+                raw_players, ball, actions, numbers = players_fut.result()
 
                 # 3. Track players (assign persistent IDs first — the team
                 #    classifier aggregates per track_id, so it needs them).
@@ -318,9 +319,14 @@ class Pipeline:
                 self.scoreboard.update(combined_events)
                 self.player_stats.update(combined_events)
 
-                # 6.4 Jersey OCR on unlocked tracks (every Nth frame per track)
+                # 6.4 Jersey OCR on unlocked tracks (every Nth frame per track).
+                #     Uses the detector's `number` bboxes when available
+                #     (tight crop around the digits) rather than the wide
+                #     heuristic chest rectangle — much higher OCR accuracy.
                 if self.jersey_recognizer is not None:
-                    self._update_jersey_numbers(frame, mapped_players, frame_count)
+                    self._update_jersey_numbers(
+                        frame, mapped_players, numbers, frame_count,
+                    )
 
                 # 6.45 Resolve persistent player identity for every mapped
                 #      player. No-op until both team and jersey are known;
@@ -560,9 +566,17 @@ class Pipeline:
         self,
         frame: np.ndarray,
         mapped_players: List[MappedPlayer],
+        numbers: list,
         frame_count: int,
     ):
-        """OCR jersey numbers on tracks not yet locked, then stamp results."""
+        """OCR jersey numbers on tracks not yet locked, then stamp results.
+
+        Prefers the detector's `number` bbox for each player (a tight crop
+        right around the digits) over the heuristic chest rectangle. When
+        no `number` bbox overlaps a player this frame we SKIP OCR for that
+        player — a blind read on no-number-visible (back turned, occluded)
+        pollutes the vote aggregator with hallucinated digits.
+        """
         recognizer = self.jersey_recognizer
         voter = self.jersey_voter
         if recognizer is None or voter is None:
@@ -571,7 +585,7 @@ class Pipeline:
         sample_every = max(1, self.config.jersey_sample_every)
 
         # Sample unlocked tracks; reuse already-locked numbers without re-OCR
-        chest_crops = []
+        crops = []
         sampled_track_ids = []
         for p in mapped_players:
             existing = voter.current(p.track_id)
@@ -580,17 +594,29 @@ class Pipeline:
             next_sample = self._jersey_sample_offset.get(p.track_id, 0)
             if frame_count < next_sample:
                 continue
-            crop = crop_chest(frame, p.bbox)
+
+            # Prefer the tight `number` bbox if the detector found one
+            # belonging to this player. Otherwise skip OCR for this frame
+            # — the wide chest rectangle was producing too many bad reads.
+            number = match_number_to_player(p.bbox, numbers)
+            if number is None:
+                # Don't waste an OCR call when the model itself didn't see
+                # a number on this player. Re-try next sample interval —
+                # they might turn around / a defender might step aside.
+                self._jersey_sample_offset[p.track_id] = frame_count + sample_every
+                continue
+            crop = crop_number_bbox(frame, number)
             if crop.size == 0:
                 continue
-            chest_crops.append(crop)
+            crop = preprocess_for_ocr(crop)
+            crops.append(crop)
             sampled_track_ids.append(p.track_id)
             self._jersey_sample_offset[p.track_id] = frame_count + sample_every
 
         # OCR each sampled crop in parallel; submit votes
-        if chest_crops:
+        if crops:
             futures = [
-                self._detector_pool.submit(recognizer.read, c) for c in chest_crops
+                self._detector_pool.submit(recognizer.read, c) for c in crops
             ]
             for tid, fut in zip(sampled_track_ids, futures):
                 resp = fut.result()

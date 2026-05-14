@@ -21,7 +21,21 @@ import cv2
 import numpy as np
 
 from config import Config
-from detector import _local_infer, _post_with_retry
+from detector import NumberDetection, _local_infer, _post_with_retry
+
+# Minimum height (px) of a jersey-number crop after upscaling. Broadcast
+# numbers are often 15-30 px tall in the source frame, which is way below
+# what the OCR model was trained on. We upscale tight `number` crops to at
+# least this height before sending — INTER_CUBIC preserves digit edges
+# better than bilinear. 96 px is a sweet spot: smaller and the model
+# starts hallucinating, bigger and we just waste bytes on the wire.
+_OCR_MIN_HEIGHT = 96
+# Padding around the number bbox before cropping, as a fraction of the
+# bbox's own dimensions. Roboflow's `number` class tends to crop tight
+# right against the digits; the OCR model wants a little quiet zone
+# around them. 25% on each side ≈ "give the digit room to breathe"
+# without dragging in stitching/neighbouring numbers.
+_NUMBER_BBOX_PADDING = 0.25
 
 
 @dataclass
@@ -85,6 +99,11 @@ def crop_chest(frame: np.ndarray, bbox: tuple) -> np.ndarray:
 
     Vertical 15-55% of the bbox: below the chin, above the waistband.
     Horizontal 20-80% of the bbox: skip arms/sleeves where digits don't sit.
+
+    Used as fallback only — prefer `crop_number_bbox` when the detector
+    surfaced a `number` bbox for this player. The chest crop is much wider
+    than the actual digits, so it gives the OCR model lots of jersey
+    background to hallucinate from.
     """
     x1, y1, x2, y2 = [int(v) for v in bbox]
     fh, fw = frame.shape[:2]
@@ -103,6 +122,95 @@ def crop_chest(frame: np.ndarray, bbox: tuple) -> np.ndarray:
     if cy2 <= cy1 or cx2 <= cx1:
         return frame[y1:y2, x1:x2]
     return frame[cy1:cy2, cx1:cx2]
+
+
+def _bbox_contains(player_bbox: tuple, point: tuple) -> bool:
+    """True iff (px, py) falls inside player_bbox (x1, y1, x2, y2)."""
+    x1, y1, x2, y2 = player_bbox
+    px, py = point
+    return x1 <= px <= x2 and y1 <= py <= y2
+
+
+def match_number_to_player(
+    player_bbox: tuple,
+    numbers: List[NumberDetection],
+) -> Optional[NumberDetection]:
+    """Pick the best `number` bbox belonging to this player, or None.
+
+    A `number` bbox belongs to the player if its CENTER falls inside the
+    player's bbox. When several numbers fall inside (rare — happens with
+    overlapping defenders), we pick the most confident one and break
+    ties by preferring numbers nearer the upper half (chest/back face on
+    a standing player, where the front/back digit lives).
+
+    Returns None when no number was detected on this player this frame —
+    in that case the caller should skip OCR, not fall back to the wider
+    chest crop. A blind read on no-number-visible is worse than no read:
+    it pollutes the vote aggregator and locks in wrong numbers.
+    """
+    if not numbers:
+        return None
+    x1, y1, x2, y2 = player_bbox
+    bbox_mid_y = (y1 + y2) / 2
+    candidates = [n for n in numbers if _bbox_contains(player_bbox, n.center)]
+    if not candidates:
+        return None
+    # Higher confidence first; on tie, prefer numbers in the upper 2/3 of
+    # the bbox (where torso digits actually sit).
+    candidates.sort(
+        key=lambda n: (-n.confidence, abs(n.center[1] - bbox_mid_y))
+    )
+    return candidates[0]
+
+
+def crop_number_bbox(
+    frame: np.ndarray,
+    number: NumberDetection,
+    padding: float = _NUMBER_BBOX_PADDING,
+) -> np.ndarray:
+    """Crop the `number` region with a small padding margin.
+
+    The detector's `number` bbox is tight around the digits; the OCR model
+    likes a small quiet zone on each side. 25% padding is enough to give
+    the digit room without pulling in neighbouring numbers / stitching.
+    """
+    x1, y1, x2, y2 = number.bbox
+    bw = x2 - x1
+    bh = y2 - y1
+    pad_x = bw * padding
+    pad_y = bh * padding
+    x1 -= pad_x
+    x2 += pad_x
+    y1 -= pad_y
+    y2 += pad_y
+    fh, fw = frame.shape[:2]
+    x1i = max(0, int(round(x1)))
+    y1i = max(0, int(round(y1)))
+    x2i = min(fw, int(round(x2)))
+    y2i = min(fh, int(round(y2)))
+    if x2i <= x1i or y2i <= y1i:
+        return np.zeros((0, 0, 3), dtype=np.uint8)
+    return frame[y1i:y2i, x1i:x2i]
+
+
+def preprocess_for_ocr(crop: np.ndarray) -> np.ndarray:
+    """Upscale tiny crops so the OCR model has enough pixels to chew on.
+
+    Roboflow's jersey-OCR was trained on chunky crops, but broadcast
+    numbers from sideline angles are often 15-30 px tall. Letting them
+    through at native size produces blurry, ambiguous reads. We upscale
+    with INTER_CUBIC (preserves digit edges better than bilinear) to at
+    least `_OCR_MIN_HEIGHT` pixels tall, keeping aspect ratio. Crops that
+    are already large enough pass through unchanged.
+    """
+    if crop.size == 0:
+        return crop
+    h, w = crop.shape[:2]
+    if h >= _OCR_MIN_HEIGHT:
+        return crop
+    scale = _OCR_MIN_HEIGHT / float(h)
+    new_w = max(1, int(round(w * scale)))
+    return cv2.resize(crop, (new_w, _OCR_MIN_HEIGHT), interpolation=cv2.INTER_CUBIC)
 
 
 def parse_jersey_response(resp: Optional[dict]) -> Optional[JerseyRead]:

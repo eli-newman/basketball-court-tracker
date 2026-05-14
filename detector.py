@@ -160,6 +160,26 @@ class ActionObservation:
     confidence: float
 
 
+@dataclass
+class NumberDetection:
+    """A `number` bbox from the player-detection model.
+
+    The detector emits a separate `number` class for each visible jersey
+    number on a player's back/chest. These are way tighter than the
+    heuristic chest-rectangle crop (`jersey.crop_chest`), so when a number
+    bbox is available the jersey-OCR step uses it directly — typically
+    cutting noise (shoulders, chest folds, background) out of the crop
+    entirely and dramatically improving OCR accuracy.
+
+    Association with a player happens downstream via bbox containment:
+    a number whose center falls inside a player's bbox belongs to that
+    player. The pipeline does that match in `_update_jersey_numbers`.
+    """
+    bbox: tuple           # (x1, y1, x2, y2)
+    center: tuple         # (cx, cy) — used for containment test against player bbox
+    confidence: float
+
+
 # Classes the detector exposes via `detect_all` in addition to players/ball.
 # Used both for shot-action observations and for the rim itself (used as a
 # geometric sanity check on `ball-in-basket` events later).
@@ -230,16 +250,21 @@ class PlayerDetector:
         See `detect_all` for the version that also returns shot-action
         observations.
         """
-        players, ball, _ = self.detect_all(frame)
+        players, ball, _, _ = self.detect_all(frame)
         return players, ball
 
     def detect_all(
         self, frame: np.ndarray,
-    ) -> tuple[List[PlayerDetection], Optional[BallDetection], List[ActionObservation]]:
-        """One inference call → players, ball, action observations.
+    ) -> tuple[
+        List[PlayerDetection],
+        Optional[BallDetection],
+        List[ActionObservation],
+        List[NumberDetection],
+    ]:
+        """One inference call → players, ball, action observations, numbers.
 
         The basketball-player-detection-3 model returns multiple classes per
-        frame. We bucket them into three streams:
+        frame. We bucket them into four streams:
 
           - **Players** (`player`, `player-in-possession`): geometry-filtered
             for sane standing-player shapes.
@@ -247,16 +272,21 @@ class PlayerDetector:
           - **Actions**: every non-player non-ball detection of interest for
             event detection (`player-jump-shot`, `player-layup-dunk`,
             `player-shot-block`, `ball-in-basket`, `rim`).
+          - **Numbers**: `number` bboxes — tight crops on the visible jersey
+            digits. Consumed by the jersey-OCR step in the pipeline; was
+            dropped on the floor before. Surfaces 25-30% of the model's
+            predictions that we used to throw away.
 
-        Everything else (`referee`, `number`, etc.) is dropped.
+        Everything else (`referee` etc.) is dropped.
         """
         result = self._call_api(frame, self.config.player_confidence)
         if result is None:
-            return [], None, []
+            return [], None, [], []
 
         players: List[PlayerDetection] = []
         ball_candidates: List[BallDetection] = []
         actions: List[ActionObservation] = []
+        numbers: List[NumberDetection] = []
 
         for pred in result.get("predictions", []):
             cls = pred.get("class", "")
@@ -301,9 +331,15 @@ class PlayerDetector:
                     class_name=cls,
                     confidence=conf,
                 ))
+            elif cls == "number":
+                numbers.append(NumberDetection(
+                    bbox=(x1, y1, x2, y2),
+                    center=(x, y),
+                    confidence=conf,
+                ))
 
         ball = max(ball_candidates, key=lambda b: b.confidence) if ball_candidates else None
-        return players, ball, actions
+        return players, ball, actions, numbers
 
     def _call_api(self, frame: np.ndarray, confidence: float) -> Optional[dict]:
         if self.config.inference_backend == "local":

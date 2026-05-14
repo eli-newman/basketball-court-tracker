@@ -8,11 +8,15 @@ import numpy as np
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
+from detector import NumberDetection
 from jersey import (
     JerseyRead,
     JerseyVoter,
     crop_chest,
+    crop_number_bbox,
+    match_number_to_player,
     parse_jersey_response,
+    preprocess_for_ocr,
 )
 
 
@@ -181,3 +185,81 @@ def test_crop_chest_empty_bbox():
     frame = np.zeros((720, 1280, 3), dtype=np.uint8)
     crop = crop_chest(frame, (500, 500, 500, 500))  # zero area
     assert crop.size == 0
+
+
+# ── number-bbox matching + cropping ────────────────────────────────────────
+
+def _num(x1, y1, x2, y2, conf=0.8):
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+    return NumberDetection(bbox=(x1, y1, x2, y2), center=(cx, cy), confidence=conf)
+
+
+def test_match_number_to_player_empty():
+    """No numbers detected → no match."""
+    assert match_number_to_player((100, 100, 200, 400), []) is None
+
+
+def test_match_number_to_player_inside():
+    """Number whose center sits in the player bbox is returned."""
+    player = (100, 100, 200, 400)
+    n = _num(140, 180, 160, 220)  # center (150, 200) inside
+    assert match_number_to_player(player, [n]) is n
+
+
+def test_match_number_to_player_outside():
+    """Number whose center is OUTSIDE the player bbox isn't matched."""
+    player = (100, 100, 200, 400)
+    n = _num(300, 180, 320, 220)  # center (310, 200) — different player
+    assert match_number_to_player(player, [n]) is None
+
+
+def test_match_number_picks_higher_confidence():
+    """When two numbers fall inside the bbox, prefer higher confidence."""
+    player = (100, 100, 200, 400)
+    low = _num(110, 180, 130, 220, conf=0.4)
+    high = _num(160, 180, 180, 220, conf=0.9)
+    out = match_number_to_player(player, [low, high])
+    assert out is high
+
+
+def test_crop_number_bbox_includes_padding():
+    """Crop is bigger than the raw bbox (padding margin)."""
+    frame = np.full((720, 1280, 3), 50, dtype=np.uint8)
+    n = _num(500, 300, 540, 350)  # 40x50 bbox
+    crop = crop_number_bbox(frame, n)
+    # 25% padding each side → +25% width, +25% height
+    assert crop.shape[0] > 50
+    assert crop.shape[1] > 40
+
+
+def test_crop_number_bbox_clamped_to_frame():
+    """Cropping near frame edge doesn't go negative or out of bounds."""
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    n = _num(0, 0, 30, 30)  # bbox right at corner
+    crop = crop_number_bbox(frame, n)
+    assert crop.size > 0
+
+
+def test_preprocess_upscales_tiny_crops():
+    """Tiny crops are upscaled to at least the OCR min height (96px)."""
+    tiny = np.zeros((20, 16, 3), dtype=np.uint8)
+    out = preprocess_for_ocr(tiny)
+    assert out.shape[0] >= 96
+    # Aspect ratio preserved (within rounding)
+    src_ratio = 16 / 20
+    out_ratio = out.shape[1] / out.shape[0]
+    assert abs(out_ratio - src_ratio) < 0.1
+
+
+def test_preprocess_passes_through_large_crops():
+    """Crops already large enough are returned unchanged."""
+    big = np.zeros((150, 120, 3), dtype=np.uint8)
+    out = preprocess_for_ocr(big)
+    assert out.shape == big.shape
+
+
+def test_preprocess_handles_empty_crop():
+    empty = np.zeros((0, 0, 3), dtype=np.uint8)
+    out = preprocess_for_ocr(empty)
+    assert out.size == 0
