@@ -100,7 +100,12 @@ class Pipeline:
         self.renderer = None
 
         # Two-worker pool: player + keypoint detection run concurrently per frame
-        self._detector_pool = ThreadPoolExecutor(max_workers=2)
+        # Worker pool sized for parallel detection + OCR. Player + court
+        # detection use 2 of these slots per frame; the rest are
+        # available for jersey-OCR HTTP calls (one per unlocked track).
+        # 12 workers means even 10 unlocked tracks finish their OCR calls
+        # in a single round-trip instead of 5 batches of 2.
+        self._detector_pool = ThreadPoolExecutor(max_workers=12)
 
     @staticmethod
     def _build_team_classifier(config: Config) -> TeamClassifier:
