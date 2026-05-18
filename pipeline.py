@@ -156,9 +156,14 @@ class Pipeline:
         print(f"Total frames: {self.video_info.total_frames}")
         print()
 
-        # Initialize renderer
+        # Initialize renderer. Pass fps + total frame count so the
+        # composite can stamp a readable "FRAME 432 / 695  0:14.40"
+        # overlay on every frame — lets a reviewer pause and tell us
+        # exactly where something looks wrong.
         self.renderer = CompositeRenderer(
-            self.config, self.video_info.width, self.video_info.height
+            self.config, self.video_info.width, self.video_info.height,
+            fps=self.video_info.fps,
+            total_frames=self.video_info.total_frames,
         )
 
         # Output paths

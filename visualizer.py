@@ -700,10 +700,25 @@ class CompositeRenderer:
       "both" — annotated broadcast | full-court (top) + half-court (bottom)
     """
 
-    def __init__(self, config: Config, video_width: int, video_height: int):
+    def __init__(
+        self,
+        config: Config,
+        video_width: int,
+        video_height: int,
+        fps: float = 30.0,
+        total_frames: int = 0,
+    ):
         self.config = config
         self.video_width = video_width
         self.video_height = video_height
+        # Used to convert frame_idx → timestamp in the on-frame counter
+        # overlay. Default 30 fps matches NBA broadcasts; pipeline should
+        # plumb the actual fps from `cv2.VideoCapture.get(CAP_PROP_FPS)`.
+        self.fps = fps if fps > 0 else 30.0
+        # Total frame count — when known, shown as "FRAME 432 / 695" so a
+        # human reviewer can ballpark progress without scrubbing. 0 hides
+        # the denominator.
+        self.total_frames = total_frames
         self.full = MinimapRenderer(config)
         self.half = HalfCourtMinimapRenderer(config)
         self.overlay = OverlayRenderer(config)
@@ -785,7 +800,74 @@ class CompositeRenderer:
             (self.video_width + 10, self.video_height - 8),
             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1,
         )
+
+        # Big frame counter in the top-left of the broadcast frame so a
+        # reviewer can pause and report "frame 432: ball jumps off court"
+        # without having to count or scrub. Top-left avoids the scoreboard
+        # in top-right.
+        self._draw_frame_counter(composite, current_frame)
+
         return composite
+
+    def _draw_frame_counter(self, composite: np.ndarray, frame_idx: int):
+        """Draw the current frame index + timestamp on the broadcast area.
+
+        Top-left, big enough to read paused, translucent dark backing
+        so it's legible against any broadcast color. Format:
+            FRAME 432 / 695
+            0:14.40
+        (Denominator omitted when total_frames is unknown.)
+        """
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        if self.total_frames > 0:
+            line1 = f"FRAME {frame_idx} / {self.total_frames}"
+        else:
+            line1 = f"FRAME {frame_idx}"
+
+        total_seconds = frame_idx / self.fps
+        minutes = int(total_seconds // 60)
+        seconds = total_seconds - minutes * 60
+        line2 = f"{minutes}:{seconds:05.2f}"
+
+        scale1, thick1 = 0.7, 2
+        scale2, thick2 = 0.6, 2
+        pad = 8
+
+        (w1, h1), _ = cv2.getTextSize(line1, font, scale1, thick1)
+        (w2, h2), _ = cv2.getTextSize(line2, font, scale2, thick2)
+        inner_gap = 4
+
+        panel_w = max(w1, w2) + pad * 2
+        panel_h = h1 + inner_gap + h2 + pad * 2
+
+        x0, y0 = 10, 10
+        x1, y1 = x0 + panel_w, y0 + panel_h
+
+        # Clamp inside the broadcast frame area (left half of composite)
+        # so the panel never bleeds into the minimap or off-frame.
+        max_x = min(self.video_width, composite.shape[1])
+        max_y = composite.shape[0]
+        if x1 > max_x:
+            x1 = max_x
+            x0 = max(0, x1 - panel_w)
+        if y1 > max_y:
+            y1 = max_y
+
+        # Translucent dark backing — same blend ratio as the scoreboard
+        # panel so visual style is consistent.
+        bg = composite[y0:y1, x0:x1].copy()
+        cv2.rectangle(bg, (0, 0), (x1 - x0, y1 - y0), (0, 0, 0), -1)
+        cv2.addWeighted(bg, 0.75, composite[y0:y1, x0:x1], 0.25, 0,
+                        composite[y0:y1, x0:x1])
+
+        text_x = x0 + pad
+        text_y1 = y0 + pad + h1 - 2
+        text_y2 = text_y1 + inner_gap + h2
+        cv2.putText(composite, line1, (text_x, text_y1), font, scale1,
+                    (255, 255, 255), thick1, cv2.LINE_AA)
+        cv2.putText(composite, line2, (text_x, text_y2), font, scale2,
+                    (200, 200, 200), thick2, cv2.LINE_AA)
 
     def _render_right_panel(
         self,
