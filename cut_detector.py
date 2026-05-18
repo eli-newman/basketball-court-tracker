@@ -41,6 +41,29 @@ from typing import Deque, Optional
 import cv2
 import numpy as np
 
+# Local copy of the team_classifier flash thresholds — kept here to avoid
+# a circular import (cut_detector is a leaf module). Values must stay in
+# sync with `team_classifier._FLASH_MEAN_V_HIGH` etc. If you tune one,
+# tune both.
+_FLASH_MEAN_V_HIGH = 170.0
+_FLASH_MEAN_V_BORDERLINE = 155.0
+_FLASH_MEAN_S_LOW = 50.0
+
+
+def _is_anomalous_lighting(frame: np.ndarray) -> bool:
+    """True iff the frame has unusual brightness/saturation indicative
+    of a replay flash, transition graphic, or scoreboard overlay."""
+    if frame is None or frame.size == 0:
+        return False
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mean_v = float(hsv[..., 2].mean())
+    mean_s = float(hsv[..., 1].mean())
+    if mean_v > _FLASH_MEAN_V_HIGH:
+        return True
+    if mean_v > _FLASH_MEAN_V_BORDERLINE and mean_s < _FLASH_MEAN_S_LOW:
+        return True
+    return False
+
 
 # Bhattacharyya distance between consecutive HSV-HS histograms above
 # which we declare a cut. Empirical from broadcast clips:
@@ -100,10 +123,20 @@ class CameraCutDetector:
         """Return True iff this frame is the first frame of a new shot.
 
         Always returns False for the very first frame — there's no
-        history to compare against.
+        history to compare against. Also returns False when the current
+        frame is itself anomalously bright/desaturated (flash, replay
+        graphic, scoreboard overlay), even if its histogram distance
+        crosses the threshold — those frames are a real visual
+        discontinuity but firing a cut on them just resets every
+        downstream state for one frame and looks like a glitch in the
+        composite. We still ADD the anomalous frame to the rolling
+        buffer so a SUSTAINED bright sequence (e.g. a multi-second
+        replay) eventually shifts the median and the cut back to live
+        action gets detected.
         """
         self._frames_since_last_cut += 1
         hist = self._compute_hist(frame)
+        is_anomalous = _is_anomalous_lighting(frame)
 
         if not self._recent_hists:
             self._recent_hists.append(hist)
@@ -125,6 +158,11 @@ class CameraCutDetector:
         # of the baseline for the next frame's comparison.
         self._recent_hists.append(hist)
 
+        if is_anomalous:
+            # Don't fire on a flash frame; the rolling median will
+            # absorb this single outlier and the next normal frame
+            # won't fire either.
+            return False
         if dist < self.cut_threshold:
             return False
         if self._frames_since_last_cut < self.refractory_frames:

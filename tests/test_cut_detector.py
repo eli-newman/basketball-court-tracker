@@ -55,12 +55,18 @@ def test_two_identical_frames_not_a_cut():
 
 
 def test_drastic_scene_change_is_a_cut():
-    """A frame full of warm tones followed by one full of cool tones is a cut."""
+    """A frame full of warm tones followed by one full of cool tones is a cut.
+
+    Uses mid-V colors (V≈140) — under the flash gate (170) so the
+    anomaly suppressor doesn't kick in. Real broadcasts always sit
+    around V≈130; anything above 170 IS a flash/graphic and SHOULD
+    be suppressed.
+    """
     det = CameraCutDetector(cut_threshold=0.45, refractory_frames=0)
-    # Warm orange-ish frame
-    det.update(_solid_frame(200, 320, (10, 80, 220)))
-    # Cool blue-ish frame
-    out = det.update(_solid_frame(200, 320, (220, 80, 10)))
+    # Warm dark-red frame: BGR (10, 50, 140) → V≈140, hue ≈ red
+    det.update(_solid_frame(200, 320, (10, 50, 140)))
+    # Cool dark-blue frame: BGR (140, 50, 10) → V≈140, hue ≈ blue
+    out = det.update(_solid_frame(200, 320, (140, 50, 10)))
     assert out is True
     assert det.last_distance is not None and det.last_distance > 0.45
 
@@ -81,9 +87,9 @@ def test_subtle_drift_below_threshold_not_a_cut():
 def test_refractory_prevents_double_fire():
     """Two cut-worthy frames in a row should only fire once."""
     det = CameraCutDetector(cut_threshold=0.45, refractory_frames=5)
-    warm = _solid_frame(200, 320, (10, 80, 220))
-    cool = _solid_frame(200, 320, (220, 80, 10))
-    green = _solid_frame(200, 320, (10, 220, 10))
+    warm = _solid_frame(200, 320, (10, 50, 140))   # mid-V red
+    cool = _solid_frame(200, 320, (140, 50, 10))   # mid-V blue
+    green = _solid_frame(200, 320, (10, 140, 10))  # mid-V green
 
     det.update(warm)
     assert det.update(cool) is True   # cut!
@@ -94,8 +100,8 @@ def test_refractory_prevents_double_fire():
 
 def test_refractory_allows_cut_after_window():
     det = CameraCutDetector(cut_threshold=0.45, refractory_frames=2)
-    warm = _solid_frame(200, 320, (10, 80, 220))
-    cool = _solid_frame(200, 320, (220, 80, 10))
+    warm = _solid_frame(200, 320, (10, 50, 140))
+    cool = _solid_frame(200, 320, (140, 50, 10))
 
     det.update(warm)
     assert det.update(cool) is True
@@ -155,11 +161,12 @@ def test_sustained_scene_change_still_fires():
     """A real cut (sustained change, not a 1-frame outlier) still fires.
 
     Guards against the rolling-median fix going too far and suppressing
-    legitimate cuts.
+    legitimate cuts. Uses mid-brightness colors so the flash gate
+    doesn't kick in.
     """
     det = CameraCutDetector(refractory_frames=1)
     scene_a = (60, 80, 90)
-    scene_b = (10, 30, 220)  # very different palette
+    scene_b = (10, 30, 140)  # very different palette, still mid-V
 
     for _ in range(5):
         det.update(_solid_frame(200, 320, scene_a))
@@ -169,3 +176,26 @@ def test_sustained_scene_change_still_fires():
     # so distance is large.
     fires = [det.update(_solid_frame(200, 320, scene_b)) for _ in range(3)]
     assert any(fires), f"expected a cut in {fires}"
+
+
+def test_anomalous_lighting_frame_never_fires_cut():
+    """A flash frame whose histogram is wildly different from the rolling
+    median should NOT trigger a cut — those are visual blips, not real
+    scene changes. Without this guard, the cut fires on the flash frame
+    itself and resets every downstream state (tracker IDs, possession,
+    homography cache) for one frame, showing up as a glitch in the
+    composite.
+    """
+    det = CameraCutDetector(refractory_frames=1)
+    scene = (60, 80, 90)
+    flash = np.full((200, 320, 3), 235, dtype=np.uint8)  # near-white
+
+    for _ in range(5):
+        det.update(_solid_frame(200, 320, scene))
+
+    # The flash frame itself MUST NOT fire even though its histogram
+    # distance is far above threshold — the anomaly suppressor catches it.
+    assert det.update(flash) is False
+    # And the next normal frame absorbs the outlier in the rolling
+    # median, so it doesn't fire either.
+    assert det.update(_solid_frame(200, 320, scene)) is False
