@@ -532,33 +532,35 @@ class TeamClassifier:
         if skin_mask.sum() > 0.5 * roi_area:
             return None
 
-        # Tier 1: strict — occlusion-masked, ≥15% body pixels. The
-        # cleanest signal; everything we'd want to base a long-term
-        # classification on.
+        # Two-tier extraction:
+        #
+        # Tier 1 (clean) — occlusion-masked, ≥15% body pixels of the ROI.
+        # Sample lands in the main rolling buffer; this is the signal we
+        # trust for long-term per-track classification.
+        #
+        # Tier 2 (bootstrap) — drop the occlusion mask, require ≥15%
+        # body pixels of the unmasked ROI. May include neighbor-jersey
+        # pixels, so the caller stores it in a per-track single-slot
+        # buffer used ONLY when no clean tier-1 sample exists yet. Goal:
+        # break the player out of UNKNOWN_TEAM without letting a noisy
+        # sample fight the median.
+        #
+        # No middle tier — a previous attempt to admit lenient
+        # occlusion-masked samples (5-15% body) into the main buffer
+        # locked tracks onto whichever team the few visible pixels
+        # happened to look like (often the jersey number/trim instead
+        # of the body color), and they took 100+ frames to drift
+        # toward the correct anchor.
         if body.sum() >= max(20, int(0.15 * roi_area)):
             self._last_extract_was_fallback = False
         else:
-            # Tier 2: lenient occlusion-masked — ≥5% body. Still
-            # uncontaminated by adjacent players (the mask did its
-            # job), but the sample is small. Useful when a player is
-            # close to another but not directly occluded.
-            if body.sum() >= max(10, int(0.05 * roi_area)):
-                self._last_extract_was_fallback = False
-            else:
-                # Tier 3: drop the occlusion mask entirely (bootstrap-
-                # only). The sample WILL include neighbor-jersey pixels
-                # if there's overlap, so it's tagged as a fallback —
-                # the caller stores it in a separate single-slot buffer
-                # that's used ONLY when no clean (tier-1/2) sample
-                # exists for this track yet. Once any clean sample
-                # lands, the fallback is discarded.
-                body_no_occl = (~skin_mask) & (v >= 20) & (v <= 250)
-                if body_no_occl.sum() < max(20, int(0.15 * roi_area)):
-                    # Even without occlusion masking there's not
-                    # enough body — ROI mostly off-frame or in shadow.
-                    return None
-                body = body_no_occl
-                self._last_extract_was_fallback = True
+            body_no_occl = (~skin_mask) & (v >= 20) & (v <= 250)
+            if body_no_occl.sum() < max(20, int(0.15 * roi_area)):
+                # Even without occlusion masking there's not enough
+                # body — ROI mostly off-frame or in deep shadow.
+                return None
+            body = body_no_occl
+            self._last_extract_was_fallback = True
 
         body_v = float(np.median(v[body]))
         body_s = float(np.median(s[body]))
