@@ -316,16 +316,7 @@ class TeamClassifier:
 
         # Per-track state
         self._track_samples: Dict[int, Deque[np.ndarray]] = {}
-        # Single-slot fallback used ONLY for tracks that have no clean
-        # sample yet (heavily-occluded from the moment they appear, e.g.
-        # a player in a tight defensive set). Cleared the instant any
-        # clean (occlusion-masked) sample lands. Keeps the contaminated
-        # bootstrap signal from poisoning the long-term median.
-        self._track_bootstrap: Dict[int, np.ndarray] = {}
         self._track_assignments: Dict[int, int] = {}  # track_id -> team_id
-        # Set per-call by `_extract_jersey_color` so `classify()` can
-        # route the returned feature to the right buffer.
-        self._last_extract_was_fallback: bool = False
 
         # Bookkeeping
         self._frame_count = 0
@@ -382,32 +373,19 @@ class TeamClassifier:
 
         # 1) Collect this frame's chest colors, masking each player's other
         #    overlapping bboxes out so defender/offensive-player overlap can't
-        #    contaminate the sample. Samples are routed to the main buffer
-        #    when extracted with the occlusion mask (clean) or to the per-
-        #    track single-slot bootstrap when the mask had to be dropped.
+        #    contaminate the sample.
         all_bboxes = [p.bbox for p in players]
         for i, player in enumerate(players):
             if player.track_id < 0:
                 continue
             others = all_bboxes[:i] + all_bboxes[i + 1:]
-            self._last_extract_was_fallback = False  # reset per call
             color = self._extract_jersey_color(frame, player, others)
             if color is None:
                 continue
-            if self._last_extract_was_fallback:
-                # Bootstrap only — store as the single-slot fallback,
-                # but ONLY if we don't already have any clean samples.
-                # Once a clean sample exists, fallbacks are ignored.
-                if not self._track_samples.get(player.track_id):
-                    self._track_bootstrap[player.track_id] = color
-            else:
-                buf = self._track_samples.setdefault(
-                    player.track_id, deque(maxlen=self._samples_per_track),
-                )
-                buf.append(color)
-                # First clean sample for this track — drop the
-                # (possibly contaminated) bootstrap.
-                self._track_bootstrap.pop(player.track_id, None)
+            buf = self._track_samples.setdefault(
+                player.track_id, deque(maxlen=self._samples_per_track),
+            )
+            buf.append(color)
 
         # 2) Refit KMeans periodically once warmed up.
         self._frames_since_refit += 1
@@ -532,35 +510,22 @@ class TeamClassifier:
         if skin_mask.sum() > 0.5 * roi_area:
             return None
 
-        # Two-tier extraction:
-        #
-        # Tier 1 (clean) — occlusion-masked, ≥15% body pixels of the ROI.
-        # Sample lands in the main rolling buffer; this is the signal we
-        # trust for long-term per-track classification.
-        #
-        # Tier 2 (bootstrap) — drop the occlusion mask, require ≥15%
-        # body pixels of the unmasked ROI. May include neighbor-jersey
-        # pixels, so the caller stores it in a per-track single-slot
-        # buffer used ONLY when no clean tier-1 sample exists yet. Goal:
-        # break the player out of UNKNOWN_TEAM without letting a noisy
-        # sample fight the median.
-        #
-        # No middle tier — a previous attempt to admit lenient
-        # occlusion-masked samples (5-15% body) into the main buffer
-        # locked tracks onto whichever team the few visible pixels
-        # happened to look like (often the jersey number/trim instead
-        # of the body color), and they took 100+ frames to drift
-        # toward the correct anchor.
-        if body.sum() >= max(20, int(0.15 * roi_area)):
-            self._last_extract_was_fallback = False
-        else:
-            body_no_occl = (~skin_mask) & (v >= 20) & (v <= 250)
-            if body_no_occl.sum() < max(20, int(0.15 * roi_area)):
-                # Even without occlusion masking there's not enough
-                # body — ROI mostly off-frame or in deep shadow.
-                return None
-            body = body_no_occl
-            self._last_extract_was_fallback = True
+        # Strict: occlusion-masked, ≥15% body pixels. If we can't get
+        # a clean sample of THIS player's jersey (not the defender's
+        # bbox covering them), we'd rather return None and leave the
+        # player as UNKNOWN_TEAM than guess. Two attempts at "do
+        # better than UNKNOWN":
+        #   - Drop occlusion mask  → contamination from neighbor pixels
+        #     classifies the player as the WRONG team confidently for
+        #     ~100 frames, looks worse on the composite than a pink
+        #     "we don't know" box.
+        #   - Lower body-pixel threshold to 5% → tiny samples land on
+        #     accent/trim pixels and lock onto wrong team.
+        # Honest is best: a player whose jersey is genuinely hidden
+        # behind a defender for the entire opening sequence cannot be
+        # classified, and we should not pretend otherwise.
+        if body.sum() < max(20, int(0.15 * roi_area)):
+            return None
 
         body_v = float(np.median(v[body]))
         body_s = float(np.median(s[body]))
@@ -605,27 +570,14 @@ class TeamClassifier:
           - Anchored: nearest-anchor by cosine similarity (no KMeans).
           - Unanchored: KMeans over per-track medians.
         """
-        # Build "track_id -> median color" using only tracks with enough
-        # samples. A track that has only the bootstrap fallback (no clean
-        # samples) still gets included, using that single sample — that's
-        # the whole point of the bootstrap: get the player ONTO a team
-        # even if their first frames are heavily occluded. As soon as
-        # the first clean sample lands, the bootstrap is cleared and
-        # this loop ignores it.
+        # Build "track_id -> median color" using only tracks with enough samples.
         track_ids: List[int] = []
         track_colors: List[np.ndarray] = []
-        seen = set()
         for tid, samples in self._track_samples.items():
             if len(samples) < self._min_samples_to_classify:
                 continue
             track_ids.append(tid)
             track_colors.append(np.median(np.stack(samples, axis=0), axis=0))
-            seen.add(tid)
-        for tid, bootstrap in self._track_bootstrap.items():
-            if tid in seen:
-                continue   # clean sample already won this track
-            track_ids.append(tid)
-            track_colors.append(bootstrap)
 
         if not track_colors:
             return
@@ -716,7 +668,6 @@ class TeamClassifier:
         producing a polluted median that drifts into unknown/wrong team.
         """
         self._track_samples.clear()
-        self._track_bootstrap.clear()
         self._track_assignments.clear()
         # Keep _kmeans, _team_anchors, _calibrated — the model is global
         # to the clip, only per-track samples are per-shot.
