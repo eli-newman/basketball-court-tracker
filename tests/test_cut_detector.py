@@ -116,3 +116,56 @@ def test_reset_clears_previous_frame_so_next_call_is_first_frame():
     # After reset, the next frame is the "first frame" — no compare possible.
     out = det.update(_solid_frame(200, 320, (220, 80, 10)))
     assert out is False
+
+
+# ── Robustness to single-frame flashes ─────────────────────────────────────
+
+def test_single_frame_flash_does_not_trigger_cut():
+    """A single anomalous frame embedded in a steady scene must not fire.
+
+    Real-world case: replay flash / transition graphic. Previously the
+    cut detector compared to the immediately-previous frame, so the
+    NEXT real frame after the flash looked enormously different and
+    triggered a false cut → tracker reset → team classifications got
+    scrambled. The rolling-median baseline should absorb the 1-frame
+    outlier.
+    """
+    det = CameraCutDetector(refractory_frames=1)
+    scene = (60, 80, 90)
+    flash = (240, 240, 240)  # near-white anomaly
+
+    # Build a stable baseline window first.
+    for _ in range(5):
+        det.update(_solid_frame(200, 320, scene))
+
+    # The anomalous frame itself can fire (it IS very different from
+    # the median), but the recovery back to scene should NOT.
+    det.update(_solid_frame(200, 320, flash))
+    # 3 consecutive normal frames — none of them should fire even
+    # though they sit right after a wildly-different flash frame.
+    next1 = det.update(_solid_frame(200, 320, scene))
+    next2 = det.update(_solid_frame(200, 320, scene))
+    next3 = det.update(_solid_frame(200, 320, scene))
+    assert next1 is False
+    assert next2 is False
+    assert next3 is False
+
+
+def test_sustained_scene_change_still_fires():
+    """A real cut (sustained change, not a 1-frame outlier) still fires.
+
+    Guards against the rolling-median fix going too far and suppressing
+    legitimate cuts.
+    """
+    det = CameraCutDetector(refractory_frames=1)
+    scene_a = (60, 80, 90)
+    scene_b = (10, 30, 220)  # very different palette
+
+    for _ in range(5):
+        det.update(_solid_frame(200, 320, scene_a))
+
+    # Sustained switch to scene B should fire within a couple frames —
+    # by the 2nd frame of scene B, the median is still mostly scene A
+    # so distance is large.
+    fires = [det.update(_solid_frame(200, 320, scene_b)) for _ in range(3)]
+    assert any(fires), f"expected a cut in {fires}"

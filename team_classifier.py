@@ -33,6 +33,48 @@ from detector import PlayerDetection
 UNKNOWN_TEAM = -1
 
 
+# ── Flash-frame gate ────────────────────────────────────────────────────────
+# Anomalous-lighting frames (replay flashes, transition graphics, scoreboard
+# overlays bleeding into the broadcast feed) produce chest crops that are
+# wildly desaturated relative to normal frames. If we let those crops into
+# the rolling sample buffer, the per-track median feature drifts toward the
+# "washed-out" point in feature space, and the next anchored re-assignment
+# pass can flip a player to the wrong team.
+#
+# Threshold rationale (verified on the Knicks/Sixers clip's frame 90):
+#   - normal arena lighting:  mean_V ≈ 130-140, mean_S ≈ 95-105
+#   - bright flash / replay:  mean_V ≈ 180-200, mean_S ≈ 50-80
+# 170 V triggers the gate alone (any normal broadcast frame sits well
+# under 170 because the crowd + court keep the mean down). Saturation
+# is a SECONDARY signal — we only use it when V is already moderately
+# elevated, to catch the "less violent flash" case (V≈155 + S≈40).
+# Pure-saturation isn't enough because synthetic-color test frames
+# with large white areas can hit mean_S≈50 even though they're stable.
+_FLASH_MEAN_V_HIGH = 170.0       # very bright frame by itself
+_FLASH_MEAN_V_BORDERLINE = 155.0 # bright-ish — only flag if also desat
+_FLASH_MEAN_S_LOW = 50.0         # paired-with-borderline-V threshold
+
+
+def is_anomalous_frame(frame: np.ndarray) -> bool:
+    """True iff the frame has unusually bright or unusually unsaturated
+    color statistics — the kind of frame that produces unreliable chest
+    crops and should be skipped for color-sample aggregation.
+
+    The check is intentionally cheap (one HSV conversion, two means) so
+    it can run unconditionally on every frame.
+    """
+    if frame is None or frame.size == 0:
+        return False
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mean_v = float(hsv[..., 2].mean())
+    mean_s = float(hsv[..., 1].mean())
+    if mean_v > _FLASH_MEAN_V_HIGH:
+        return True
+    if mean_v > _FLASH_MEAN_V_BORDERLINE and mean_s < _FLASH_MEAN_S_LOW:
+        return True
+    return False
+
+
 # ── Canonical NBA team color signatures ─────────────────────────────────────
 # Each profile is a 4-D vector matching the feature order produced by
 # `_extract_jersey_color`:
@@ -279,6 +321,11 @@ class TeamClassifier:
         # Bookkeeping
         self._frame_count = 0
         self._frames_since_refit = 0
+        # Diagnostic: how many frames the flash gate rejected during the
+        # run. Surfaced via `n_flash_frames_skipped` for the end-of-run
+        # summary so we can tell if the gate fired too often (would
+        # indicate the thresholds are too tight for this broadcast).
+        self._flash_frames_skipped = 0
 
         # Debug: dump every chest crop we sample to disk. When set, each
         # sampled ROI is written to `<dir>/track_<id>_<frame>.png` with the
@@ -308,6 +355,21 @@ class TeamClassifier:
         if not players:
             return []
         self._frame_count += 1
+
+        # Flash gate: skip sample accumulation entirely on anomalous-
+        # lighting frames (replay flashes, transition graphics). The
+        # crops on those frames are wildly desaturated and would shift
+        # each track's rolling-median feature in the wrong direction —
+        # which then causes a wrong-team flip on the very next normal
+        # frame. We still RETURN current assignments built from the
+        # existing buffer so the rest of the pipeline keeps a stable
+        # team_id stream.
+        if is_anomalous_frame(frame):
+            self._flash_frames_skipped += 1
+            return [
+                self._track_assignments.get(p.track_id, UNKNOWN_TEAM)
+                for p in players
+            ]
 
         # 1) Collect this frame's chest colors, masking each player's other
         #    overlapping bboxes out so defender/offensive-player overlap can't
@@ -598,6 +660,16 @@ class TeamClassifier:
     @property
     def is_calibrated(self) -> bool:
         return self._calibrated
+
+    @property
+    def n_flash_frames_skipped(self) -> int:
+        """How many frames the flash gate rejected during the run.
+
+        End-of-run summary surfaces this so we can tell if the gate
+        fired too often (would indicate thresholds are too tight for
+        this broadcast).
+        """
+        return self._flash_frames_skipped
 
     @property
     def team_colors_bgr(self) -> List[Tuple[int, int, int]]:

@@ -1,4 +1,4 @@
-"""Detect hard camera cuts between consecutive frames.
+"""Detect hard camera cuts robust to single-frame flashes.
 
 A camera cut is a sudden change of viewpoint — sideline switching to
 baseline, live action to replay, broadcast to scoreboard graphic. The
@@ -9,10 +9,17 @@ the 58-tracks-for-10-players problem.
 
 Detection method
 ----------------
-Compute a 2-D hue/saturation histogram of each frame, compare to the
-previous frame's histogram by Bhattacharyya distance. Distance is in
-[0, 1] where 0 means identical and 1 means totally different. Hard
-cuts produce a sudden jump well above what continuous motion does.
+Compute a 2-D hue/saturation histogram of each frame and compare it to
+the per-bin MEDIAN of the last few frames' histograms via Bhattacharyya
+distance. Distance is in [0, 1] where 0 means identical and 1 means
+totally different.
+
+Why median-not-prev: a single anomalous frame (replay flash, transition
+graphic, scoreboard overlay) makes the NEXT real frame look enormously
+different from "the previous frame" → cut detector mis-fires → tracker
+bindings reset → team classifications scrambled. The median of a small
+rolling window absorbs one outlier without moving, so single-frame
+flashes don't trigger; sustained scene changes still do.
 
 We pick the histogram over hue+saturation instead of full BGR for two
 reasons:
@@ -53,6 +60,16 @@ _DEFAULT_CUT_THRESHOLD = 0.35
 # register as cut-out + cut-in).
 _DEFAULT_REFRACTORY_FRAMES = 5
 
+# Number of recent frame histograms to take the per-bin median of as the
+# comparison baseline. 5 is the sweet spot:
+#   - small enough to react to a real cut within ~5 frames (the median
+#     shifts toward the new scene as the window fills with new frames),
+#   - large enough that 1 outlier in 5 leaves the median dominated by
+#     the 4 normal frames, so single-frame flashes don't move it.
+# Below 3 we lose robustness; above ~10 we get sluggish recovery from
+# legitimate cuts (the old scene keeps weighting the median).
+_HIST_WINDOW = 5
+
 
 class CameraCutDetector:
     """Per-frame cut detection from HSV histogram differences."""
@@ -63,13 +80,18 @@ class CameraCutDetector:
         refractory_frames: int = _DEFAULT_REFRACTORY_FRAMES,
         h_bins: int = 24,
         s_bins: int = 24,
+        hist_window: int = _HIST_WINDOW,
     ):
         self.cut_threshold = cut_threshold
         self.refractory_frames = refractory_frames
         self._h_bins = h_bins
         self._s_bins = s_bins
+        self._hist_window = hist_window
 
-        self._prev_hist: Optional[np.ndarray] = None
+        # Rolling buffer of recent frame histograms. Comparison baseline
+        # is the per-bin median across this buffer, NOT just the last
+        # frame's hist — so single-frame anomalies can't trigger a cut.
+        self._recent_hists: Deque[np.ndarray] = deque(maxlen=hist_window)
         self._frames_since_last_cut: int = 10**6
         # Last few distances — exposed for debugging / tuning.
         self._distances: Deque[float] = deque(maxlen=30)
@@ -78,20 +100,30 @@ class CameraCutDetector:
         """Return True iff this frame is the first frame of a new shot.
 
         Always returns False for the very first frame — there's no
-        previous frame to compare against.
+        history to compare against.
         """
         self._frames_since_last_cut += 1
         hist = self._compute_hist(frame)
 
-        if self._prev_hist is None:
-            self._prev_hist = hist
+        if not self._recent_hists:
+            self._recent_hists.append(hist)
             return False
 
+        # Per-bin median across the buffer is robust to single outliers.
+        # Stack into shape (N, H_BINS, S_BINS) and take element-wise
+        # median over the first axis.
+        stacked = np.stack(list(self._recent_hists), axis=0)
+        median_hist = np.median(stacked, axis=0).astype(np.float32)
+
         dist = float(cv2.compareHist(
-            self._prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA,
+            median_hist, hist, cv2.HISTCMP_BHATTACHARYYA,
         ))
         self._distances.append(dist)
-        self._prev_hist = hist
+
+        # Always append AFTER measuring, so the current frame doesn't
+        # bias its own comparison baseline. The new frame becomes part
+        # of the baseline for the next frame's comparison.
+        self._recent_hists.append(hist)
 
         if dist < self.cut_threshold:
             return False
@@ -125,6 +157,6 @@ class CameraCutDetector:
 
     def reset(self):
         """Forget previous-frame state. Use when the input source restarts."""
-        self._prev_hist = None
+        self._recent_hists.clear()
         self._frames_since_last_cut = 10**6
         self._distances.clear()

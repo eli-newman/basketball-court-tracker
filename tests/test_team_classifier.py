@@ -15,6 +15,7 @@ from team_classifier import (
     TeamClassifier,
     UNKNOWN_TEAM,
     _nearest_anchor,
+    is_anomalous_frame,
     resolve_team_profile,
 )
 
@@ -325,3 +326,52 @@ def test_anchored_classifier_rejects_mismatched_names_count():
             team_anchors=[TEAM_PROFILES["knicks"], TEAM_PROFILES["sixers"]],
             team_names=["knicks"],
         )
+
+
+# ── Flash-frame gate ────────────────────────────────────────────────────────
+
+
+def test_anomalous_frame_detects_bright_flash():
+    """A near-white frame (replay flash / transition) is flagged."""
+    flash = np.full((600, 800, 3), 235, dtype=np.uint8)
+    assert is_anomalous_frame(flash) is True
+
+
+def test_anomalous_frame_passes_normal_broadcast_palette():
+    """A realistic broadcast palette (court tan + crowd + jerseys) is NOT flagged."""
+    # Roughly the HSV distribution of a real broadcast frame: ~half
+    # court (warm tan, moderately saturated), ~quarter dark crowd,
+    # ~quarter mid-saturation jerseys.
+    f = np.zeros((600, 800, 3), dtype=np.uint8)
+    f[:, :400] = (60, 110, 160)   # tan court (B,G,R)
+    f[:, 400:600] = (40, 40, 40)  # dark crowd
+    f[:, 600:] = (180, 80, 50)    # blue-ish jerseys
+    assert is_anomalous_frame(f) is False
+
+
+def test_anomalous_frame_handles_empty():
+    """Defensive: empty/None frame must not crash."""
+    assert is_anomalous_frame(np.zeros((0, 0, 3), dtype=np.uint8)) is False
+    assert is_anomalous_frame(None) is False
+
+
+def test_flash_frame_skips_sample_accumulation():
+    """Anomalous-lighting frames must not add to the per-track sample buffer.
+
+    Before this guard, a bright frame's washed-out chest crops would
+    pollute each track's rolling median feature and the next normal
+    frame's anchored re-assignment would flip players to the wrong team.
+    """
+    clf = TeamClassifier(
+        n_teams=2,
+        team_anchors=[TEAM_PROFILES["knicks"], TEAM_PROFILES["sixers"]],
+        team_names=["knicks", "sixers"],
+    )
+    flash = np.full((600, 800, 3), 235, dtype=np.uint8)
+    player = _player(track_id=1, bbox=(100, 100, 300, 500))
+
+    initial_skips = clf.n_flash_frames_skipped
+    clf.classify(flash, [player])
+    assert clf.n_flash_frames_skipped == initial_skips + 1
+    # No sample should have been added since the frame was flagged.
+    assert 1 not in clf._track_samples or len(clf._track_samples[1]) == 0
