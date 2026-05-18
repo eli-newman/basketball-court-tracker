@@ -509,8 +509,27 @@ class TeamClassifier:
         roi_area = H * W
         if skin_mask.sum() > 0.5 * roi_area:
             return None
+
+        # Occlusion-aware fallback: when a player is tightly defended,
+        # another player's bbox can cover 80%+ of the chest ROI and the
+        # body-pixel count drops below the 15% acceptance floor. The
+        # player then stays UNKNOWN_TEAM for dozens of frames — diagnosed
+        # on this clip's track #1, who was unclassified for 81 frames
+        # while standing next to track #6 in offensive sets.
+        #
+        # When occlusion-masked body pixels are too few, we retry with
+        # the occlusion mask DROPPED. The resulting sample may include
+        # some of the adjacent player's jersey color, but for most NBA
+        # matchups (dark home + light road) one team's body lightness is
+        # different enough that even a 60/40-contaminated sample lands
+        # the player on the correct anchor. Better than perpetual UNKNOWN.
         if body.sum() < max(20, int(0.15 * roi_area)):
-            return None
+            body_no_occl = (~skin_mask) & (v >= 20) & (v <= 250)
+            if body_no_occl.sum() < max(20, int(0.15 * roi_area)):
+                # Still not enough body pixels even without occlusion —
+                # the ROI is mostly off-frame or in shadow. Reject for real.
+                return None
+            body = body_no_occl
 
         body_v = float(np.median(v[body]))
         body_s = float(np.median(s[body]))
