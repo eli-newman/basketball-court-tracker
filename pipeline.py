@@ -71,6 +71,11 @@ class Pipeline:
             cut_threshold=config.cut_threshold,
         )
         self._cuts_seen: int = 0
+        # Segment ID — increments on every detected cut. Used by the
+        # two-pass consensus renderer to ensure track IDs reused across
+        # cut boundaries don't get their (different-player) frames
+        # merged into one majority vote.
+        self._current_segment_id: int = 0
         self.half_selector = ActiveHalfSelector(
             history_frames=config.half_hysteresis_frames,
         )
@@ -214,6 +219,12 @@ class Pipeline:
                 # don't try to match new players to stale track IDs.
                 if self.cut_detector.update(frame):
                     self._cuts_seen += 1
+                    # _cut_segment_id ticks every cut so consensus team_ids
+                    # can be computed PER SEGMENT — track ID #1 in segment
+                    # 0 is a different human than track ID #1 in segment 1
+                    # (ByteTrack re-issues low IDs after the reset below),
+                    # and consensus must not lump their frames together.
+                    self._current_segment_id += 1
                     self.tracker.reset()
                     self.possession.reset()
                     self.events.reset_shot_progress()
@@ -367,6 +378,7 @@ class Pipeline:
                 # events known by THAT frame, so capture a list copy here.
                 render_state_buffer.append({
                     "frame_count": frame_count,
+                    "segment_id": self._current_segment_id,
                     "sv_dets": self.tracker.last_sv_detections,
                     "mapped_players": mapped_players,
                     "h_valid": h_valid,
@@ -414,15 +426,19 @@ class Pipeline:
         consensus = self._compute_consensus_team_ids(render_state_buffer)
         # Apply consensus to the buffered mapped_players AND rewrite
         # team_id in all_frame_data so JSON/CSV reflect the consensus.
-        for state in render_state_buffer:
+        # Key is (segment_id, track_id) — see _compute_consensus.
+        # We have to walk render_state_buffer and all_frame_data together
+        # so each frame_data record can be tagged with its segment.
+        for state, fd in zip(render_state_buffer, all_frame_data):
+            seg = state["segment_id"]
             for mp in state["mapped_players"]:
-                if mp.track_id in consensus:
-                    mp.team_id = consensus[mp.track_id]
-        for fd in all_frame_data:
+                key = (seg, mp.track_id)
+                if key in consensus:
+                    mp.team_id = consensus[key]
             for pr in fd.get("players", []):
-                tid = pr.get("track_id")
-                if tid in consensus:
-                    pr["team_id"] = consensus[tid]
+                key = (seg, pr.get("track_id"))
+                if key in consensus:
+                    pr["team_id"] = consensus[key]
 
         # Pass 2 render — re-open the video, walk frames, render each
         # using buffered state + consensus team_ids, write to mp4.
@@ -529,29 +545,38 @@ class Pipeline:
 
     def _compute_consensus_team_ids(
         self, render_state_buffer: list[dict],
-    ) -> dict[int, int]:
-        """For each track_id, return the team_id it was assigned most often.
+    ) -> dict[tuple[int, int], int]:
+        """Per-segment consensus team_id, keyed on (segment_id, track_id).
 
-        Unknown (-1) votes are ignored — a player whose jersey is briefly
-        visible should still pick up THAT team's color across the whole
-        clip, even if 80% of their frames were heavily occluded.
+        After a camera cut the tracker resets and ByteTrack reissues low
+        track IDs. So track #1 in segment 0 might be a Sixer; track #1
+        in segment 1 is a different human, possibly a Knick. A naive
+        majority across the whole clip lumps both together and picks
+        whichever segment had more frames — flipping the early-segment
+        player to the wrong team.
 
-        Returns {} for tracks that were never classified to a known team
-        (genuinely never had a clean sample); those stay UNKNOWN in the
-        composite (the honest "we couldn't see them" answer).
+        We key the vote on the (segment_id, track_id) pair so each
+        cut-bounded segment is judged independently. Unknown votes
+        are ignored — one clear glimpse of the jersey in a segment
+        wins for that segment.
+
+        Returns {} for (segment, track) pairs that were never classified
+        — those stay UNKNOWN in the composite.
         """
         from collections import Counter
-        votes: dict[int, Counter] = {}
+        votes: dict[tuple[int, int], Counter] = {}
         for state in render_state_buffer:
+            seg = state["segment_id"]
             for mp in state["mapped_players"]:
                 if mp.track_id < 0 or mp.team_id < 0:
                     continue
-                votes.setdefault(mp.track_id, Counter())[mp.team_id] += 1
-        consensus: dict[int, int] = {}
-        for tid, counter in votes.items():
+                key = (seg, mp.track_id)
+                votes.setdefault(key, Counter())[mp.team_id] += 1
+        consensus: dict[tuple[int, int], int] = {}
+        for key, counter in votes.items():
             if not counter:
                 continue
-            consensus[tid] = counter.most_common(1)[0][0]
+            consensus[key] = counter.most_common(1)[0][0]
         return consensus
 
     def _team_label(self, team_id: int) -> str:
