@@ -179,6 +179,14 @@ class Pipeline:
         )
 
         all_frame_data = []
+        # Buffer of per-frame render inputs. We defer rendering until after
+        # the inference pass so we can compute each track's CONSENSUS team
+        # across the whole clip and apply it retroactively to every frame
+        # — fixes the "track #1 stays UNKNOWN/pink while heavily occluded
+        # at the start" problem without faking a sample we can't actually
+        # measure. Once all team_ids are settled, pass 2 re-reads the
+        # video and renders with consensus colors.
+        render_state_buffer: list[dict] = []
         frame_count = 0
         processed = 0
         valid_homography_count = 0
@@ -189,7 +197,10 @@ class Pipeline:
             stride=self.config.frame_skip,
         )
 
-        with sv.VideoSink(video_out, output_info) as sink:
+        # Pass 1: inference + state collection. NO RENDERING in this pass —
+        # we don't know each track's consensus team yet. Composite is built
+        # at the end in pass 2.
+        if True:  # preserved indent for minimal diff
             for frame in frame_gen:
                 frame_count += 1
 
@@ -349,26 +360,22 @@ class Pipeline:
                 # 6.5 Pick active half from court keypoints (with hysteresis)
                 active_half = self.half_selector.update(keypoints)
 
-                # 7. Render composite frame
-                composite = self.renderer.render(
-                    frame,
-                    self.tracker.last_sv_detections,
-                    mapped_players,
-                    h_valid,
-                    active_half=active_half,
-                    keypoints=keypoints if self.config.debug else None,
-                    ball=ball,
-                    mapped_ball=mapped_ball,
-                    shot_events=combined_events,
-                    current_frame=frame_count,
-                    scoreboard=self.scoreboard,
-                    team_labels=self._team_labels_map(),
-                    player_stats=self.player_stats,
-                    identity=self.identity,
-                )
-
-                # 8. Write frame
-                sink.write_frame(composite)
+                # 7. Buffer render inputs for pass 2 (no rendering yet).
+                # Snapshot mutable lists/objects so later mutations don't
+                # rewrite history. combined_events grows as the clip
+                # progresses — we want each frame's render to see only
+                # events known by THAT frame, so capture a list copy here.
+                render_state_buffer.append({
+                    "frame_count": frame_count,
+                    "sv_dets": self.tracker.last_sv_detections,
+                    "mapped_players": mapped_players,
+                    "h_valid": h_valid,
+                    "active_half": active_half,
+                    "keypoints": keypoints if self.config.debug else None,
+                    "ball": ball,
+                    "mapped_ball": mapped_ball,
+                    "shot_events": list(combined_events),
+                })
 
                 # 9. Collect coordinate data
                 frame_data = self._build_frame_record(
@@ -395,6 +402,61 @@ class Pipeline:
                     )
 
         elapsed = time.time() - start_time
+
+        # ── Phase 2: consensus team_ids + composite render ─────────────
+        # For every track, count how often each team_id was assigned
+        # across the WHOLE clip. The most-common non-unknown team wins
+        # and gets applied retroactively to every frame of that track.
+        # Handles the "heavily-occluded opening" case (track #1 in this
+        # clip stayed UNKNOWN/wrong-team for the first ~80 frames while
+        # tightly defended) — once we see the player clearly later, we
+        # know what team they were the whole time.
+        consensus = self._compute_consensus_team_ids(render_state_buffer)
+        # Apply consensus to the buffered mapped_players AND rewrite
+        # team_id in all_frame_data so JSON/CSV reflect the consensus.
+        for state in render_state_buffer:
+            for mp in state["mapped_players"]:
+                if mp.track_id in consensus:
+                    mp.team_id = consensus[mp.track_id]
+        for fd in all_frame_data:
+            for pr in fd.get("players", []):
+                tid = pr.get("track_id")
+                if tid in consensus:
+                    pr["team_id"] = consensus[tid]
+
+        # Pass 2 render — re-open the video, walk frames, render each
+        # using buffered state + consensus team_ids, write to mp4.
+        print(f"\nPhase 2: rendering composite from {len(render_state_buffer)} buffered frames...")
+        render_start = time.time()
+        frame_gen2 = sv.get_video_frames_generator(
+            self.config.video_path,
+            stride=self.config.frame_skip,
+        )
+        team_labels = self._team_labels_map()
+        with sv.VideoSink(video_out, output_info) as sink:
+            for i, frame in enumerate(frame_gen2):
+                if i >= len(render_state_buffer):
+                    break
+                state = render_state_buffer[i]
+                composite = self.renderer.render(
+                    frame,
+                    state["sv_dets"],
+                    state["mapped_players"],
+                    state["h_valid"],
+                    active_half=state["active_half"],
+                    keypoints=state["keypoints"],
+                    ball=state["ball"],
+                    mapped_ball=state["mapped_ball"],
+                    shot_events=state["shot_events"],
+                    current_frame=state["frame_count"],
+                    scoreboard=self.scoreboard,
+                    team_labels=team_labels,
+                    player_stats=self.player_stats,
+                    identity=self.identity,
+                )
+                sink.write_frame(composite)
+        render_elapsed = time.time() - render_start
+        print(f"Phase 2 done in {render_elapsed:.1f}s")
 
         # Save coordinate data
         self._save_json(all_frame_data, json_out)
@@ -464,6 +526,33 @@ class Pipeline:
         return {
             tid: self._team_label(tid) for tid in range(self.config.n_teams)
         }
+
+    def _compute_consensus_team_ids(
+        self, render_state_buffer: list[dict],
+    ) -> dict[int, int]:
+        """For each track_id, return the team_id it was assigned most often.
+
+        Unknown (-1) votes are ignored — a player whose jersey is briefly
+        visible should still pick up THAT team's color across the whole
+        clip, even if 80% of their frames were heavily occluded.
+
+        Returns {} for tracks that were never classified to a known team
+        (genuinely never had a clean sample); those stay UNKNOWN in the
+        composite (the honest "we couldn't see them" answer).
+        """
+        from collections import Counter
+        votes: dict[int, Counter] = {}
+        for state in render_state_buffer:
+            for mp in state["mapped_players"]:
+                if mp.track_id < 0 or mp.team_id < 0:
+                    continue
+                votes.setdefault(mp.track_id, Counter())[mp.team_id] += 1
+        consensus: dict[int, int] = {}
+        for tid, counter in votes.items():
+            if not counter:
+                continue
+            consensus[tid] = counter.most_common(1)[0][0]
+        return consensus
 
     def _team_label(self, team_id: int) -> str:
         """Display name for a team in the summary line.

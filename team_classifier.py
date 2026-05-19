@@ -510,53 +510,19 @@ class TeamClassifier:
         if skin_mask.sum() > 0.5 * roi_area:
             return None
 
-        # Strict chest-ROI body pixels. If this is enough, we use the
-        # tightly-targeted chest signal as-is.
+        # Strict chest-ROI body pixels — if this is enough, we use the
+        # tightly-targeted chest signal as-is. Otherwise honest UNKNOWN.
+        # An expanded full-bbox fallback was tried (commit 42192c3) and
+        # reverted: when a player is heavily occluded, the un-blocked
+        # parts of their bbox are mostly bbox-padding-around-the-player
+        # (court floor / crowd) rather than the player's actual body,
+        # so the expanded sample drifts toward background colors and
+        # locks onto the wrong team. The two-pass renderer (consensus
+        # team_id retroactively applied to all of a track's frames)
+        # solves the visible-misclassification problem without needing
+        # to fake a sample we can't actually take.
         if body.sum() < max(20, int(0.15 * roi_area)):
-            # Chest ROI is blocked (defender's bbox covers it). But the
-            # player's SHORTS, sleeves, lower torso are still visible
-            # in the rest of their bbox — and shorts/sleeves carry the
-            # same team colorway as the jersey. Expand the sampling
-            # region to the FULL player bbox (still applying skin +
-            # occlusion masks, so we never sample the defender's
-            # pixels). For a side-by-side overlap, the vertical strips
-            # of #1's bbox that fall outside #6's bbox usually contain
-            # plenty of shorts/jersey-side material — way more than
-            # the 15% body floor.
-            full_h, full_w = (y2 - y1), (x2 - x1)
-            full_crop = frame[y1:y2, x1:x2]
-            if full_crop.size == 0:
-                return None
-            full_hsv = cv2.cvtColor(full_crop, cv2.COLOR_BGR2HSV)
-            full_h_ch = full_hsv[:, :, 0]
-            full_s = full_hsv[:, :, 1]
-            full_v = full_hsv[:, :, 2]
-            full_skin = (
-                ((full_h_ch <= 25) | (full_h_ch >= 170))
-                & (full_s >= 20) & (full_s <= 200)
-                & (full_v >= 40) & (full_v <= 200)
-            )
-            full_occl = np.ones((full_h, full_w), dtype=bool)
-            for ox1, oy1, ox2, oy2 in other_bboxes:
-                ix1 = max(0, int(ox1) - x1)
-                iy1 = max(0, int(oy1) - y1)
-                ix2 = min(full_w, int(ox2) - x1)
-                iy2 = min(full_h, int(oy2) - y1)
-                if ix2 > ix1 and iy2 > iy1:
-                    full_occl[iy1:iy2, ix1:ix2] = False
-            full_body = (~full_skin) & full_occl & (full_v >= 20) & (full_v <= 250)
-            full_area = full_h * full_w
-            if full_body.sum() < max(20, int(0.15 * full_area)):
-                # Even the full-bbox sample doesn't have enough visible
-                # body pixels — player is genuinely off-frame or
-                # entirely behind another player. Honest UNKNOWN.
-                return None
-            # Re-bind locals so the feature-extraction code below uses
-            # the full-bbox sample.
-            v = full_v
-            s = full_s
-            h = full_h_ch
-            body = full_body
+            return None
 
         body_v = float(np.median(v[body]))
         body_s = float(np.median(s[body]))
