@@ -510,22 +510,53 @@ class TeamClassifier:
         if skin_mask.sum() > 0.5 * roi_area:
             return None
 
-        # Strict: occlusion-masked, ≥15% body pixels. If we can't get
-        # a clean sample of THIS player's jersey (not the defender's
-        # bbox covering them), we'd rather return None and leave the
-        # player as UNKNOWN_TEAM than guess. Two attempts at "do
-        # better than UNKNOWN":
-        #   - Drop occlusion mask  → contamination from neighbor pixels
-        #     classifies the player as the WRONG team confidently for
-        #     ~100 frames, looks worse on the composite than a pink
-        #     "we don't know" box.
-        #   - Lower body-pixel threshold to 5% → tiny samples land on
-        #     accent/trim pixels and lock onto wrong team.
-        # Honest is best: a player whose jersey is genuinely hidden
-        # behind a defender for the entire opening sequence cannot be
-        # classified, and we should not pretend otherwise.
+        # Strict chest-ROI body pixels. If this is enough, we use the
+        # tightly-targeted chest signal as-is.
         if body.sum() < max(20, int(0.15 * roi_area)):
-            return None
+            # Chest ROI is blocked (defender's bbox covers it). But the
+            # player's SHORTS, sleeves, lower torso are still visible
+            # in the rest of their bbox — and shorts/sleeves carry the
+            # same team colorway as the jersey. Expand the sampling
+            # region to the FULL player bbox (still applying skin +
+            # occlusion masks, so we never sample the defender's
+            # pixels). For a side-by-side overlap, the vertical strips
+            # of #1's bbox that fall outside #6's bbox usually contain
+            # plenty of shorts/jersey-side material — way more than
+            # the 15% body floor.
+            full_h, full_w = (y2 - y1), (x2 - x1)
+            full_crop = frame[y1:y2, x1:x2]
+            if full_crop.size == 0:
+                return None
+            full_hsv = cv2.cvtColor(full_crop, cv2.COLOR_BGR2HSV)
+            full_h_ch = full_hsv[:, :, 0]
+            full_s = full_hsv[:, :, 1]
+            full_v = full_hsv[:, :, 2]
+            full_skin = (
+                ((full_h_ch <= 25) | (full_h_ch >= 170))
+                & (full_s >= 20) & (full_s <= 200)
+                & (full_v >= 40) & (full_v <= 200)
+            )
+            full_occl = np.ones((full_h, full_w), dtype=bool)
+            for ox1, oy1, ox2, oy2 in other_bboxes:
+                ix1 = max(0, int(ox1) - x1)
+                iy1 = max(0, int(oy1) - y1)
+                ix2 = min(full_w, int(ox2) - x1)
+                iy2 = min(full_h, int(oy2) - y1)
+                if ix2 > ix1 and iy2 > iy1:
+                    full_occl[iy1:iy2, ix1:ix2] = False
+            full_body = (~full_skin) & full_occl & (full_v >= 20) & (full_v <= 250)
+            full_area = full_h * full_w
+            if full_body.sum() < max(20, int(0.15 * full_area)):
+                # Even the full-bbox sample doesn't have enough visible
+                # body pixels — player is genuinely off-frame or
+                # entirely behind another player. Honest UNKNOWN.
+                return None
+            # Re-bind locals so the feature-extraction code below uses
+            # the full-bbox sample.
+            v = full_v
+            s = full_s
+            h = full_h_ch
+            body = full_body
 
         body_v = float(np.median(v[body]))
         body_s = float(np.median(s[body]))
